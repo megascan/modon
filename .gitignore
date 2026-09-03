@@ -1,0 +1,18 @@
+# Binaries
+/modon
+/modon.exe
+
+# SQLite test/index artefacts
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Blender
+*.blend
+*.blend1
+
+# OS / editor
+.DS_Store
