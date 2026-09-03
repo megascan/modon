@@ -86,11 +86,14 @@ Usage:
   modon import [flags] <dir>    Import a directory of meshes into the local index
   modon search [flags] <query>  Search owned first, then poly.pizza + Fab
   modon details <id>            Show full details (local:N, polypizza:ID, fab:UID)
-  modon preview <id> [--out f]  Fetch/render a preview image
-  modon download <id> [--dest d] [--mode copy|symlink|reference]
+  modon preview [flags] <id>    Fetch/render a preview image
+  modon download [flags] <id>   Download (or reference) an asset
   modon config [get|set|path]   Inspect or change configuration
   modon stats                   Local index statistics + config status
   modon help | version
+
+NOTE: flags must come before positional args, e.g.
+  modon preview --out thumb.png local:3   (not: modon preview local:3 --out ...)
 
 Setup flags:
   --polypizza-key KEY   poly.pizza API key (or MODON_POLYPIZZA_API_KEY)

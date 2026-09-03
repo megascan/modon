@@ -93,7 +93,10 @@ func (r *Renderer) Render(ctx context.Context, assetPath, outPNG string, size in
 		args := []string{assetPath, "--output", outPNG, "--resolution", fmt.Sprintf("%d %d", size, size)}
 		cmd = exec.CommandContext(cctx, r.f3d, args...)
 	} else {
-		args := []string{"--background", assetPath, "--python", scriptPath(), "--", outPNG, strconv.Itoa(size)}
+		// The embedded script imports the asset by extension, so Blender
+		// always starts empty (passing a mesh as the startup file fails with
+		// "File format is not supported" for anything but .blend).
+		args := []string{"--background", "--python", scriptPath(), "--", assetPath, outPNG, strconv.Itoa(size)}
 		cmd = exec.CommandContext(cctx, r.blender, args...)
 	}
 	out, err := cmd.CombinedOutput()

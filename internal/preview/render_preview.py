@@ -1,13 +1,56 @@
-# Renders a turntable-ish thumbnail of the open document with Workbench.
-# Usage: blender -b <file> --python render_preview.py -- <output.png> <size>
-import math
+# Renders a turntable-ish thumbnail of a mesh file with Workbench.
+# Usage: blender --background --python render_preview.py -- <asset> <output.png> <size>
+# The asset is imported by extension (.blend files are opened directly).
+# Exits non-zero with an error on stderr when the format is unsupported.
+import os
 import sys
+import traceback
 
 import bpy
-from mathutils import Vector
 
 argv = sys.argv[sys.argv.index("--") + 1:]
-out, size = argv[0], int(argv[1])
+asset, out, size = argv[0], argv[1], int(argv[2])
+
+ext = os.path.splitext(asset)[1].lower()
+
+
+def fail(msg):
+    print("MODON_PREVIEW_ERROR:" + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    if ext == ".blend":
+        bpy.ops.wm.open_mainfile(filepath=asset)
+    else:
+        # Start from an empty scene: the startup file's default Cube would
+        # otherwise swallow small assets and dominate the framing.
+        bpy.ops.object.select_all(action="SELECT")
+        bpy.ops.object.delete(use_global=False)
+        if ext in (".gltf", ".glb"):
+            bpy.ops.import_scene.gltf(filepath=asset)
+        elif ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=asset)
+        elif ext == ".fbx":
+            bpy.ops.import_scene.fbx(filepath=asset)
+        elif ext == ".stl":
+            bpy.ops.wm.stl_import(filepath=asset)
+        elif ext == ".ply":
+            bpy.ops.wm.ply_import(filepath=asset)
+        elif ext == ".dae":
+            bpy.ops.wm.collada_import(filepath=asset)
+        elif ext in (".usd", ".usda", ".usdc", ".usdz"):
+            bpy.ops.wm.usd_import(filepath=asset)
+        elif ext == ".abc":
+            bpy.ops.wm.alembic_import(filepath=asset)
+        else:
+            fail("unsupported format %r (no Blender importer)" % ext)
+except SystemExit:
+    raise
+except Exception:
+    fail(traceback.format_exc(limit=3).strip().splitlines()[-1])
+
+from mathutils import Vector
 
 scene = bpy.context.scene
 scene.render.engine = "BLENDER_WORKBENCH"
