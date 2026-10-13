@@ -56,12 +56,21 @@ type Asset struct {
 	Rating      float64 `json:"rating,omitempty"`
 	ReviewCount int     `json:"review_count,omitempty"`
 
+	// Search diagnostics: fused relevance (higher is better) and which
+	// signals matched (keyword, text, image).
+	Score     float64  `json:"score,omitempty"`
+	MatchedBy []string `json:"matched_by,omitempty"`
+	// Similarity is the raw preview-vs-preview cosine in find_similar
+	// results (1.0 = identical thumbnail).
+	Similarity float64 `json:"similarity,omitempty"`
+
 	RowID int64 `json:"-"` // local index row id
 }
 
 // Query is a normalized search request. Fields with no value are ignored.
 type Query struct {
 	Text      string   // free text
+	Image     string   // query-by-image: local path, http(s) URL or data: URL (local index only)
 	Tags      []string // extra keywords that must/may match
 	Category  string
 	Style     string

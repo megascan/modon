@@ -96,6 +96,10 @@ func (r *Registry) Search(ctx context.Context, q model.Query, sources []string) 
 			out.Notes = append(out.Notes, unavailableNote(src.Name(), r.cfg))
 			continue
 		}
+		if q.Text == "" && q.Image != "" && src.Name() != model.SourceLocal {
+			out.Notes = append(out.Notes, src.Name()+": skipped, image queries search the local index only (add query text to search remotes)")
+			continue
+		}
 		sq := q
 		sq.Limit = limit
 		res, err := src.Search(ctx, sq)
