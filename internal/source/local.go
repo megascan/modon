@@ -40,8 +40,8 @@ func (l *Local) Search(ctx context.Context, q model.Query) ([]model.Asset, error
 	if l.Searcher != nil {
 		return l.Searcher.Search(ctx, q)
 	}
-	if q.Image != "" && q.Text == "" {
-		return nil, fmt.Errorf("image search needs semantic search: set embedding.endpoint (see modon help)")
+	if (q.Image != "" && q.Text == "") || q.StyleRef != "" {
+		return nil, fmt.Errorf("image and style search need semantic search: set embedding.endpoint (see modon help)")
 	}
 	return l.Store.Search(q)
 }

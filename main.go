@@ -124,6 +124,8 @@ Search flags:
   --animated / --static / --free / --max-price F
   --sources local,polypizza,fab   --limit N (default 12)   --json
   --image PATH|URL                query the local index by a reference picture
+  --style-ref REF --style-weight F  keep a look: re-rank owned hits toward an image
+                                  or asset id (local:N, fab:..); weight 0..1 (0.5)
 
 Semantic search (EmbeddingGemma 2):
   modon config set embedding.endpoint http://127.0.0.1:8178
@@ -282,16 +284,19 @@ func cmdSearch(args []string) error {
 	limit := fs.Int("limit", 12, "")
 	asJSON := fs.Bool("json", false, "")
 	image := fs.String("image", "", "")
+	styleRef := fs.String("style-ref", "", "")
+	styleWeight := fs.Float64("style-weight", 0, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	q := model.Query{
-		Text:      strings.Join(fs.Args(), " "),
-		Image:     *image,
-		Category:  *category,
-		Style:     *style,
-		AssetType: *atype,
-		Limit:     *limit,
+		Text:        strings.Join(fs.Args(), " "),
+		Image:       *image,
+		StyleWeight: *styleWeight,
+		Category:    *category,
+		Style:       *style,
+		AssetType:   *atype,
+		Limit:       *limit,
 	}
 	if *animated {
 		t := true
@@ -321,6 +326,11 @@ func cmdSearch(args []string) error {
 	}
 	defer d.Close()
 	startSidecar(d, 0)
+	if *styleRef != "" {
+		if q.StyleRef, err = server.StyleRef(context.Background(), d, *styleRef); err != nil {
+			return err
+		}
+	}
 	out, err := d.Reg.Search(context.Background(), q, srcs)
 	if err != nil {
 		return err

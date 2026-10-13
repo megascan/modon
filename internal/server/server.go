@@ -15,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"modon/internal/config"
+	"modon/internal/embed"
 	importdir "modon/internal/importer"
 	"modon/internal/model"
 	"modon/internal/semantic"
@@ -91,7 +92,7 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_assets",
-		Description: "Search 3D mesh assets across owned/local index first, then poly.pizza and Fab. Supports free-text, tags, category, style, asset type, animation filter, price range and source selection. With semantic search enabled, local results are ranked by meaning and by what the preview thumbnail looks like (EmbeddingGemma 2), so descriptive queries like 'mossy stone ruin' find badly named files; pass image to search the local index by a reference picture. Local hits carry score and matched_by (keyword/text/image). Paid results are flagged purchase_required per config (ask/allow/deny) so the agent can ask the user before buying.",
+		Description: "Search 3D mesh assets across owned/local index first, then poly.pizza and Fab. Supports free-text, tags, category, style, asset type, animation filter, price range and source selection. With semantic search enabled, local results are ranked by meaning and by what the preview thumbnail looks like (EmbeddingGemma 2), so descriptive queries like 'mossy stone ruin' find badly named files; pass image to search the local index by a reference picture, or style_reference (an image or an asset id such as one already used in the scene) to keep results in a consistent art style. Local hits carry score and matched_by (keyword/text/image). Paid results are flagged purchase_required per config (ask/allow/deny) so the agent can ask the user before buying.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, any, error) {
 		return handleSearch(ctx, d, in)
 	})
@@ -183,6 +184,9 @@ type SearchInput struct {
 	Sources   []string `json:"sources,omitempty" jsonschema:"Subset of sources to search: local, polypizza, fab. Default searches all configured sources owned-first."`
 	Limit     int      `json:"limit,omitempty" jsonschema:"Max results per search, default 12"`
 	Image     string   `json:"image,omitempty" jsonschema:"Query by image: local file path, http(s) URL or data: URL of a reference picture (searches the local index; needs semantic search)"`
+
+	StyleReference string  `json:"style_reference,omitempty" jsonschema:"Keep a consistent look: owned results are re-ranked toward this reference while the query text still decides what the object is. An image path/URL, local:<id> of an owned asset (e.g. one already in the scene), or a polypizza:/fab: id (its preview is used). Needs semantic search."`
+	StyleWeight    float64 `json:"style_weight,omitempty" jsonschema:"How much the reference look counts versus relevance, 0..1 (default 0.5; higher = stricter style match)"`
 }
 
 type SimilarInput struct {
@@ -248,6 +252,15 @@ func handleSearch(ctx context.Context, d *Deps, in SearchInput) (*mcp.CallToolRe
 		Animated:  in.Animated,
 		Limit:     in.Limit,
 		Image:     in.Image,
+
+		StyleWeight: in.StyleWeight,
+	}
+	if in.StyleReference != "" {
+		ref, err := StyleRef(ctx, d, in.StyleReference)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		q.StyleRef = ref
 	}
 	if in.FreeOnly {
 		t := true
@@ -449,6 +462,24 @@ func errResult(err error) *mcp.CallToolResult {
 		Content: []mcp.Content{&mcp.TextContent{Text: "error: " + err.Error()}},
 		IsError: true,
 	}
+}
+
+// StyleRef turns a style reference into something the semantic engine can
+// embed: local ids and images pass through; remote asset ids become their
+// preview image.
+func StyleRef(ctx context.Context, d *Deps, ref string) (string, error) {
+	src, _, err := source.SplitID(ref)
+	if err != nil || src == model.SourceLocal || strings.Contains(ref, "/") {
+		return ref, nil // a path/URL, or local:<id>
+	}
+	if src != model.SourcePolyPizza && src != model.SourceFab {
+		return ref, nil
+	}
+	data, mime, _, err := d.Reg.Preview(ctx, ref)
+	if err != nil {
+		return "", fmt.Errorf("style reference %s: %w", ref, err)
+	}
+	return embed.DataURL(data, mime), nil
 }
 
 // SimilarRef resolves an asset id into a semantic reference, fetching remote

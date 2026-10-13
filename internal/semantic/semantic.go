@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -444,11 +445,35 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 	if limit <= 0 {
 		limit = 12
 	}
-	if (q.Text == "" && q.Image == "") || !e.available(ctx) {
+	if q.StyleRef != "" && !e.available(ctx) {
+		return nil, fmt.Errorf("style_reference needs the embedding server (%s)", e.statusHint())
+	}
+	if (q.Text == "" && q.Image == "" && q.StyleRef == "") || !e.available(ctx) {
 		if q.Image != "" && q.Text == "" {
 			return nil, fmt.Errorf("image search needs the embedding server (%s)", e.statusHint())
 		}
 		return e.st.Search(q)
+	}
+
+	var sv []float32 // style reference vector
+	if q.StyleRef != "" {
+		_, imageM, err := e.matrices()
+		if err != nil {
+			return nil, err
+		}
+		if sv, err = e.styleVec(ctx, q.StyleRef, imageM); err != nil {
+			return nil, err
+		}
+		if q.Text == "" && q.Image == "" {
+			// Nothing to be relevant to: "things that look like this".
+			allowed, err := e.st.FilteredIDs(q)
+			if err != nil {
+				return nil, err
+			}
+			out, err := e.fuseZ([]zpart{{"style", 1, imageM, sv}}, allowed, 0, limit)
+			setSimilarity(out, sv, imageM)
+			return out, err
+		}
 	}
 
 	var signals []signal
@@ -515,7 +540,95 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 			signal{"image", 1.5, hitIDs(rank(imageM, iv, nil, allowed, 0, 0, poolSize))},
 			signal{"text", 0.5, hitIDs(rank(textM, iv, nil, allowed, 0, 0, poolSize))})
 	}
-	return e.fuse(signals, limit)
+	if sv == nil {
+		return e.fuse(signals, limit)
+	}
+	pool := max(3*limit, 30)
+	cands, err := e.fuse(signals, pool)
+	if err != nil {
+		return nil, err
+	}
+	return restyle(cands, sv, imageM, q.StyleWeight, limit), nil
+}
+
+// styleVec resolves a style reference: "local:<id>" uses that asset's
+// stored preview vector, anything else is embedded as an image.
+func (e *Engine) styleVec(ctx context.Context, ref string, imageM *store.Matrix) ([]float32, error) {
+	if rest, ok := strings.CutPrefix(ref, model.SourceLocal+":"); ok {
+		id, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("style reference %q: local ids are numeric", ref)
+		}
+		if v := imageM.Row(id); v != nil {
+			return v, nil
+		}
+		return nil, fmt.Errorf("style reference %s has no preview vector yet (modon embed --render)", ref)
+	}
+	v, err := e.cl.EmbedOne(ctx, embed.Input{Image: ref})
+	if err != nil {
+		return nil, fmt.Errorf("embed style reference: %w", err)
+	}
+	return v, nil
+}
+
+// restyle re-ranks relevance-ordered candidates toward a style reference.
+// The query text already decided *what* the candidates are (all barrels),
+// so among them preview similarity mostly reflects the look: low-poly vs
+// realistic, palette, texture treatment. Final order blends relevance rank
+// and style rank; weight is the style share (default 0.5). Candidates
+// without a preview sit just below the middle on style. Similarity reports
+// each hit's preview cosine to the reference.
+func restyle(cands []model.Asset, sv []float32, imageM *store.Matrix, weight float64, limit int) []model.Asset {
+	if weight <= 0 || weight > 1 {
+		weight = 0.5
+	}
+	n := len(cands)
+	if n == 0 {
+		return cands
+	}
+	setSimilarity(cands, sv, imageM)
+	withImg := make([]int, 0, n)
+	for i, a := range cands {
+		if imageM.Row(a.RowID) != nil {
+			withImg = append(withImg, i)
+		}
+	}
+	sort.SliceStable(withImg, func(x, y int) bool { return cands[withImg[x]].Similarity > cands[withImg[y]].Similarity })
+	styleNorm := make([]float64, n)
+	for i := range styleNorm {
+		styleNorm[i] = 0.4
+	}
+	for pos, i := range withImg {
+		styleNorm[i] = 1 - float64(pos)/float64(len(withImg))
+		if pos < (len(withImg)+2)/3 {
+			cands[i].MatchedBy = append(cands[i].MatchedBy, "style")
+		}
+	}
+	blend := make([]float64, n)
+	for i := range cands {
+		blend[i] = (1-weight)*(1-float64(i)/float64(n)) + weight*styleNorm[i]
+	}
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(x, y int) bool { return blend[idx[x]] > blend[idx[y]] })
+	out := make([]model.Asset, 0, min(limit, n))
+	for _, i := range idx[:min(limit, n)] {
+		a := cands[i]
+		a.Score = math.Round(blend[i]*1000) / 1000
+		out = append(out, a)
+	}
+	return out
+}
+
+// setSimilarity fills Similarity with each asset's preview cosine to v.
+func setSimilarity(assets []model.Asset, v []float32, imageM *store.Matrix) {
+	for i := range assets {
+		if row := imageM.Row(assets[i].RowID); row != nil {
+			assets[i].Similarity = math.Round(float64(embed.Dot(v, row))*1000) / 1000
+		}
+	}
 }
 
 // ---- similar ----
@@ -576,11 +689,7 @@ func (e *Engine) Similar(ctx context.Context, ref Ref, q model.Query) ([]model.A
 	// Raw visual similarity is what tells an agent "you own something that
 	// looks like this" before buying.
 	if iv != nil {
-		for i := range out {
-			if row := imageM.Row(out[i].RowID); row != nil {
-				out[i].Similarity = math.Round(float64(embed.Dot(iv, row))*1000) / 1000
-			}
-		}
+		setSimilarity(out, iv, imageM)
 	}
 	return out, nil
 }

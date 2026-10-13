@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"math/rand/v2"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -372,5 +374,46 @@ func TestSparseImageCoverageIsIgnored(t *testing.T) {
 	}
 	if !usable(big, few) || !usable(few, &store.Matrix{IDs: []int64{1, 2, 3}}) {
 		t.Fatal("well-covered signals and small libraries stay usable")
+	}
+}
+
+func TestStyleReferenceReranksTowardTheLook(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	prev := filepath.Join(dir, "p5.png")
+	_ = os.WriteFile(prev, []byte("style-B-pixels"), 0o644)
+	id5, err := f.st.Upsert(model.Asset{PrimaryFile: "/assets/props/SM_Prop_05.fbx", Title: "SM Prop 05", Description: "a blue fabric sofa"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.st.SetPreview(id5, prev, "ok")
+	if _, err := f.eng.Backfill(ctx, BackfillOptions{Text: true, Images: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := filepath.Join(dir, "ref.png")
+	_ = os.WriteFile(ref, []byte("style-B-pixels"), 0o644)
+	res, err := f.eng.Search(ctx, model.Query{Text: "sofa", StyleRef: ref, StyleWeight: 0.7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 || res[0].RowID != id5 {
+		t.Fatalf("style ref should lift the matching sofa first: %+v", res)
+	}
+	if res[0].Similarity < 0.999 || !slices.Contains(res[0].MatchedBy, "style") {
+		t.Fatalf("diagnostics: similarity=%v matched_by=%v", res[0].Similarity, res[0].MatchedBy)
+	}
+
+	// An owned asset works as the reference too.
+	res, err = f.eng.Search(ctx, model.Query{Text: "sofa", StyleRef: fmt.Sprintf("local:%d", f.ids["SM Prop 01"])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 || res[0].RowID != f.ids["SM Prop 01"] {
+		t.Fatalf("local style ref: %+v", res)
+	}
+	if _, err := f.eng.Search(ctx, model.Query{Text: "sofa", StyleRef: fmt.Sprintf("local:%d", f.ids["rock big"])}); err == nil {
+		t.Fatal("a reference without a preview must say so")
 	}
 }

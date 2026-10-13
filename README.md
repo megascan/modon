@@ -42,7 +42,7 @@ preserved across re-imports).
 
 | Tool | What it does |
 |---|---|
-| `search_assets` | Free-text + tags/category/style/type/animated/free/max-price/source/limit search, or `image` (query by picture). Owned (`local`) results come first, hybrid-ranked when semantic search is on (`score`, `matched_by`); paid hits carry `purchase_required: true`. |
+| `search_assets` | Free-text + tags/category/style/type/animated/free/max-price/source/limit search, or `image` (query by picture), plus `style_reference` (image or asset id) to keep a consistent look. Owned (`local`) results come first, hybrid-ranked when semantic search is on (`score`, `matched_by`); paid hits carry `purchase_required: true`. |
 | `find_similar` | Owned assets that look like / are described like `local:` (variants, duplicates) or a remote `polypizza:`/`fab:` result (*"you already own one like this"* before buying). |
 | `suggest_metadata` | Zero-shot category + art-style guesses (with confidence margin) from a local asset's preview and text. |
 | `embed_index` | Build/refresh vectors (incremental), optionally render missing previews and auto-fill empty categories. |
@@ -161,6 +161,8 @@ modon config set embedding.autostart true   # or run `modon embed-server` yourse
 modon embed --render                        # render missing previews, embed everything
 modon search "mossy stone ruin"             # hybrid; results show score + matched_by
 modon search --image ref.png                # query by picture
+modon search --style-ref local:2373 table   # tables that look like owned asset 2373
+modon search --style-ref ref.png --style-weight 0.7 barrel
 modon similar fab:<uid>                     # owned look-alikes of a paid listing
 modon suggest local:42                      # zero-shot category/style
 modon embed --eval                          # zero-shot accuracy vs. importer categories
@@ -188,6 +190,15 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   a 24k library) is ignored. Facet filters (category/style/tags/animated/
   type) apply to vector hits too. Task prefixes follow the model card (`task: search result |
   query: …` / `title: … | text: …`; images unprefixed).
+- **Style references.** `style_reference` / `--style-ref` takes an image
+  or an asset id (`local:N` — e.g. something already in the scene — or a
+  `fab:`/`polypizza:` id, whose preview is used). The query text picks a
+  relevant candidate pool (3× the limit); those are re-ranked by preview
+  similarity to the reference, blended with relevance by `style_weight`
+  (default 0.5). Among candidates that are all "tables", similarity mostly
+  reflects the look: a gothic stone chair pulls ornate turned-leg tables to
+  the top, a thin metal office chair pulls minimalist metal-frame ones.
+  Without query text it returns the closest-looking owned assets.
 - **find_similar / image queries** fuse per-signal z-scores (visual and
   text weighted equally for find_similar) so an exact match is not
   flattened by rank fusion; `similarity` is the raw preview-vs-preview

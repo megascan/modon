@@ -96,9 +96,12 @@ func (r *Registry) Search(ctx context.Context, q model.Query, sources []string) 
 			out.Notes = append(out.Notes, unavailableNote(src.Name(), r.cfg))
 			continue
 		}
-		if q.Text == "" && q.Image != "" && src.Name() != model.SourceLocal {
-			out.Notes = append(out.Notes, src.Name()+": skipped, image queries search the local index only (add query text to search remotes)")
+		if q.Text == "" && (q.Image != "" || q.StyleRef != "") && src.Name() != model.SourceLocal {
+			out.Notes = append(out.Notes, src.Name()+": skipped, image/style-only queries search the local index only (add query text to search remotes)")
 			continue
+		}
+		if q.StyleRef != "" && src.Name() != model.SourceLocal {
+			out.Notes = append(out.Notes, src.Name()+": style_reference re-ranks owned (local) results only; use find_similar on a remote hit to compare it")
 		}
 		sq := q
 		sq.Limit = limit
