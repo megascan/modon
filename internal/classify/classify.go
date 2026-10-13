@@ -6,6 +6,7 @@ package classify
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"modon/internal/parse"
@@ -229,6 +230,19 @@ func tokenize(s string) []string {
 		if w != "" {
 			out = append(out, w)
 		}
+	}
+	return out
+}
+
+// CategoryVocabulary returns each canonical category with the keywords that
+// map to it (sorted), for zero-shot labelling.
+func CategoryVocabulary() map[string][]string {
+	out := map[string][]string{}
+	for kw, c := range categoryKeywords {
+		out[c] = append(out[c], kw)
+	}
+	for c := range out {
+		sort.Strings(out[c])
 	}
 	return out
 }

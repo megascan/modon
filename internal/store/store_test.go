@@ -86,3 +86,89 @@ func TestUpdateMetadataClearsReview(t *testing.T) {
 		t.Fatalf("expected 0 unclassified, got %d", len(un))
 	}
 }
+
+func TestVectorsRoundTripAndCascade(t *testing.T) {
+	st := openTest(t)
+	id, err := st.Upsert(model.Asset{PrimaryFile: "/tmp/v.obj", Title: "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutVector(id, VecText, "m", "h1", []float32{0.6, 0.8}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.Vectors(VecText, "m", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := m.Row(id); len(row) != 2 || row[0] != 0.6 || row[1] != 0.8 {
+		t.Fatalf("row = %v", row)
+	}
+	if other, _ := st.Vectors(VecText, "m", 4); len(other.IDs) != 0 {
+		t.Fatal("vectors of another dimension must not load")
+	}
+	// The cache refreshes after writes.
+	if err := st.PutVector(id, VecText, "m", "h2", []float32{1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = st.Vectors(VecText, "m", 2)
+	if m.Row(id)[0] != 1 {
+		t.Fatal("stale vector cache")
+	}
+	if h, _ := st.VectorHashes(VecText, "m", 2); h[id] != "h2" {
+		t.Fatalf("hashes = %v", h)
+	}
+	if _, err := st.db.Exec(`DELETE FROM assets WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if n := st.VectorCounts()[VecText]; n != 0 {
+		t.Fatalf("vectors must cascade-delete with their asset, %d left", n)
+	}
+}
+
+func TestSearchModeReportsStrictness(t *testing.T) {
+	st := openTest(t)
+	if _, err := st.Upsert(model.Asset{PrimaryFile: "/tmp/oak_tree.obj", Title: "oak tree"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ q, want string }{
+		{"oak tree", MatchAll},
+		{"tree", MatchAll},
+		{"tree for a forest", MatchAny}, // only the loose OR fallback matches
+		{"", MatchNone},
+	} {
+		_, mode, err := st.SearchMode(model.Query{Text: c.q})
+		if err != nil || mode != c.want {
+			t.Errorf("SearchMode(%q) = %q, %v; want %q", c.q, mode, err, c.want)
+		}
+	}
+}
+
+// A long-running MCP server must see vectors another process (modon embed)
+// writes to the same index.
+func TestVectorCacheSeesOtherProcesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	server, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	cli, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	id, err := cli.Upsert(model.Asset{PrimaryFile: "/tmp/x.obj", Title: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := server.Vectors(VecImage, "m", 2); len(m.IDs) != 0 {
+		t.Fatal("expected an empty matrix first")
+	}
+	if err := cli.PutVector(id, VecImage, "m", "h", []float32{1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := server.Vectors(VecImage, "m", 2); len(m.IDs) != 1 {
+		t.Fatalf("cache did not pick up another connection's write: %d rows", len(m.IDs))
+	}
+}

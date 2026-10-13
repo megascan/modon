@@ -30,7 +30,12 @@ type Config struct {
 	Preview struct {
 		Renderer string `json:"renderer,omitempty"` // auto | blender | f3d | none
 		Size     int    `json:"size,omitempty"`
+		Workers  int    `json:"workers,omitempty"` // parallel renders, default 2
 	} `json:"preview,omitempty"`
+
+	// Embedding enables semantic search with EmbeddingGemma 2. Empty
+	// Endpoint disables it (keyword search only).
+	Embedding EmbeddingConfig `json:"embedding,omitempty"`
 
 	// FabAutoClaimFree, when true, lets download_asset claim free Fab listings
 	// into the user's library automatically (requires auth cookie).
@@ -41,6 +46,20 @@ type Config struct {
 
 	// HTTPTimeoutSeconds bounds remote HTTP calls.
 	HTTPTimeoutSeconds int `json:"http_timeout_seconds,omitempty"`
+}
+
+// EmbeddingConfig points modon at an embedding server: the bundled sidecar
+// (`modon embed-server`, text + images) or any OpenAI-compatible
+// /v1/embeddings server (text only).
+type EmbeddingConfig struct {
+	Endpoint       string `json:"endpoint,omitempty"`        // e.g. http://127.0.0.1:8178
+	Model          string `json:"model,omitempty"`           // default google/embeddinggemma-2
+	Dims           int    `json:"dims,omitempty"`            // Matryoshka size: 768, 512, 256 (default), 128
+	Autostart      bool   `json:"autostart,omitempty"`       // launch the sidecar via uv when nothing answers
+	ImageTokens    int    `json:"image_tokens,omitempty"`    // vision tokens per image, 70-1120 (default 280)
+	Device         string `json:"device,omitempty"`          // sidecar device: cuda | cpu | mps (default auto)
+	UVPath         string `json:"uv_path,omitempty"`         // default: uv in PATH
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // per request, default 300
 }
 
 // Defaults returns the configuration with all optional fields populated.
@@ -119,22 +138,21 @@ func xdgData(parts ...string) (string, error) {
 	return p, nil
 }
 
-// Load reads the config file. A missing file yields Defaults.
+// Load reads the config file. A missing file yields Defaults; environment
+// overrides apply either way.
 func Load() (*Config, error) {
 	c := Defaults()
-	path, err := ConfigPath()
-	if err != nil {
-		return c, nil
-	}
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return c, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(raw, c); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+	if path, err := ConfigPath(); err == nil {
+		raw, err := os.ReadFile(path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return nil, err
+		default:
+			if err := json.Unmarshal(raw, c); err != nil {
+				return nil, fmt.Errorf("parse %s: %w", path, err)
+			}
+		}
 	}
 	c.applyEnv()
 	c.normalize()
@@ -153,6 +171,9 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("MODON_PURCHASE_POLICY"); v != "" {
 		c.PurchasePolicy = v
+	}
+	if v := os.Getenv("MODON_EMBED_ENDPOINT"); v != "" {
+		c.Embedding.Endpoint = v
 	}
 	if v := os.Getenv("MODON_MAX_PRICE"); v != "" {
 		var f float64
@@ -174,6 +195,15 @@ func (c *Config) normalize() {
 	}
 	if c.HTTPTimeoutSeconds <= 0 {
 		c.HTTPTimeoutSeconds = 30
+	}
+	if c.Embedding.Dims <= 0 {
+		c.Embedding.Dims = 256
+	}
+	if c.Embedding.Model == "" {
+		c.Embedding.Model = "google/embeddinggemma-2"
+	}
+	if c.Embedding.TimeoutSeconds <= 0 {
+		c.Embedding.TimeoutSeconds = 300
 	}
 	if c.Currency == "" {
 		c.Currency = "USD"
@@ -209,5 +239,6 @@ func (c *Config) Status() map[string]any {
 		"max_price":             c.MaxPrice,
 		"currency":              c.Currency,
 		"default_sources":       c.DefaultSources,
+		"embedding_endpoint":    c.Embedding.Endpoint,
 	}
 }

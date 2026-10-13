@@ -17,8 +17,10 @@ import (
 )
 
 type Store struct {
-	db  *sql.DB
-	fts bool
+	db   *sql.DB
+	path string
+	fts  bool
+	vc   vecCache
 }
 
 func Open(path string) (*Store, error) {
@@ -30,7 +32,7 @@ func Open(path string) (*Store, error) {
 	// modernc sqlite is happiest with a single connection; the index is not
 	// write-concurrent.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -39,6 +41,9 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// Path is the database file location.
+func (s *Store) Path() string { return s.path }
 
 func (s *Store) migrate() error {
 	q := `CREATE TABLE IF NOT EXISTS assets (
@@ -70,6 +75,9 @@ func (s *Store) migrate() error {
 	)`
 	if _, err := s.db.Exec(q); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := s.migrateVectors(); err != nil {
+		return fmt.Errorf("migrate vectors: %w", err)
 	}
 	fts := `CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
 		title, name, description, category, style, tags, creator,
@@ -339,9 +347,23 @@ func queryStrings(q model.Query, prefix string) (wheres []string, args []any) {
 	return wheres, args
 }
 
+// Keyword match modes reported by SearchMode, strictest first.
+const (
+	MatchAll  = "all"  // every query token matched (FTS AND)
+	MatchAny  = "any"  // loose fallback: any token (FTS OR) or substring LIKE
+	MatchNone = "none" // no text query: plain filtered listing
+)
+
 // Search runs a weighted full-text (or LIKE fallback) search with optional
 // facet filters. Local assets are always free, so price filters are ignored.
 func (s *Store) Search(q model.Query) ([]model.Asset, error) {
+	assets, _, err := s.SearchMode(q)
+	return assets, err
+}
+
+// SearchMode is Search that also reports how strictly the text matched, so
+// hybrid ranking can trust loose fallback matches less.
+func (s *Store) SearchMode(q model.Query) ([]model.Asset, string, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 12
@@ -353,24 +375,30 @@ func (s *Store) Search(q model.Query) ([]model.Asset, error) {
 
 	tokens := searchTokens(q.Text)
 	var assets []model.Asset
+	mode := MatchNone
 
 	if s.fts && len(tokens) > 0 {
-		for _, match := range ftsQueries(tokens) {
+		for i, match := range ftsQueries(tokens) {
 			query := `SELECT ` + selectColsAlias + `, bm25(assets_fts, 12.0, 4.0, 3.0, 4.0, 3.0, 5.0, 2.0) AS score
 				FROM assets_fts JOIN assets a ON a.id = assets_fts.rowid
 				WHERE assets_fts MATCH ?` + andClause(aliasFilter) + ` ORDER BY score LIMIT ?`
 			rows, err := s.db.Query(query, append([]any{match}, append(wargs, limit)...)...)
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			assets = collectFTS(rows)
 			if len(assets) > 0 {
+				mode = MatchAny
+				if i == 0 || len(tokens) == 1 {
+					mode = MatchAll
+				}
 				break
 			}
 		}
 	}
 	if len(assets) == 0 {
 		if len(tokens) > 0 {
+			mode = MatchAny
 			var likes []string
 			var largs []any
 			for _, t := range tokens {
@@ -385,14 +413,14 @@ func (s *Store) Search(q model.Query) ([]model.Asset, error) {
 			query := `SELECT ` + selectCols + ` FROM assets WHERE (` + strings.Join(likes, " AND ") + `)` + andClause(filter) + ` LIMIT ?`
 			rows, err := s.db.Query(query, append(largs, append(wargs, limit)...)...)
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			assets = collect(rows)
 		} else {
 			query := `SELECT ` + selectCols + ` FROM assets` + whereClause(filter) + ` ORDER BY id LIMIT ?`
 			rows, err := s.db.Query(query, append(wargs, limit)...)
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			assets = collect(rows)
 		}
@@ -410,7 +438,7 @@ func (s *Store) Search(q model.Query) ([]model.Asset, error) {
 			return assets[i].RowID < assets[j].RowID
 		})
 	}
-	return assets, nil
+	return assets, mode, nil
 }
 
 func andClause(cond string) string {

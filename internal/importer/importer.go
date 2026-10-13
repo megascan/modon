@@ -164,50 +164,83 @@ func Directory(ctx context.Context, st *store.Store, cfg *config.Config, dir str
 	return stats, nil
 }
 
-// renderPreviews renders thumbnails for assets that lack one.
+// renderPreviews renders thumbnails for imported assets that lack one.
 func renderPreviews(ctx context.Context, st *store.Store, cfg *config.Config, assets []impAsset, opts Options) int {
+	ids := make([]int64, len(assets))
+	for i, a := range assets {
+		ids[i] = a.rowID
+	}
+	return RenderPreviews(ctx, st, cfg, ids, opts.MaxPreviews, opts.PreviewProgress)
+}
+
+// RenderPreviews renders Blender/f3d thumbnails for the given local assets
+// that have none yet and returns how many were rendered. Jobs go out in
+// batches (one Blender session renders a whole batch), preview.workers
+// sessions at a time. limit caps the number attempted (0 = all).
+func RenderPreviews(ctx context.Context, st *store.Store, cfg *config.Config, ids []int64, limit int, progress func(done, total int, path string)) int {
 	r := preview.New(cfg)
 	if r.Available() == "" {
-		return 0
-	}
-	pending := assets
-	if opts.MaxPreviews > 0 && len(pending) > opts.MaxPreviews {
-		pending = pending[:opts.MaxPreviews]
-	}
-	if len(pending) == 0 {
 		return 0
 	}
 	cache, err := config.CacheDir()
 	if err != nil {
 		return 0
 	}
+	var jobs []preview.Job
+	idFor := map[string]int64{}
+	for _, id := range ids {
+		if limit > 0 && len(jobs) >= limit {
+			break
+		}
+		a, err := st.GetByID(id)
+		if err != nil || a.PreviewPath != "" {
+			continue
+		}
+		out := filepath.Join(cache, "previews", fmt.Sprintf("%d.png", id))
+		jobs = append(jobs, preview.Job{Asset: a.PrimaryFile, Out: out})
+		idFor[out] = id
+	}
+	if len(jobs) == 0 {
+		return 0
+	}
+	workers := cfg.Preview.Workers
+	if workers <= 0 {
+		workers = 2
+	}
+	const batchSize = 25
+	batches := make(chan []preview.Job)
+	go func() {
+		defer close(batches)
+		for i := 0; i < len(jobs); i += batchSize {
+			select {
+			case batches <- jobs[i:min(i+batchSize, len(jobs))]:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	var done, rendered atomic.Int64
-	sem := make(chan struct{}, 2)
 	var wg sync.WaitGroup
-	for _, it := range pending {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(it impAsset) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if ctx.Err() != nil {
-				return
+			for b := range batches {
+				r.RenderBatch(ctx, b, cfg.Preview.Size, func(j preview.Job, err error) {
+					id := idFor[j.Out]
+					if err != nil {
+						_ = st.SetPreview(id, "", "failed")
+					} else {
+						_ = st.SetPreview(id, j.Out, "ok")
+						rendered.Add(1)
+					}
+					if progress != nil {
+						progress(int(done.Add(1)), len(jobs), j.Asset)
+					}
+				})
 			}
-			a, err := st.GetByID(it.rowID)
-			if err != nil || a.PreviewPath != "" {
-				return
-			}
-			out := filepath.Join(cache, "previews", fmt.Sprintf("%d.png", it.rowID))
-			if err := r.Render(ctx, a.PrimaryFile, out, cfg.Preview.Size); err != nil {
-				_ = st.SetPreview(it.rowID, "", "failed")
-			} else {
-				_ = st.SetPreview(it.rowID, out, "ok")
-				rendered.Add(1)
-			}
-			if opts.PreviewProgress != nil {
-				opts.PreviewProgress(int(done.Add(1)), len(pending), a.PrimaryFile)
-			}
-		}(it)
+		}()
 	}
 	wg.Wait()
 	return int(rendered.Load())

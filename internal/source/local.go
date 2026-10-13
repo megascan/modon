@@ -15,11 +15,18 @@ import (
 	"modon/internal/store"
 )
 
+// Searcher replaces plain keyword search for the local index (the semantic
+// engine's hybrid search).
+type Searcher interface {
+	Search(ctx context.Context, q model.Query) ([]model.Asset, error)
+}
+
 // Local serves assets from the on-disk SQLite index.
 type Local struct {
-	Store  *store.Store
-	cfg    *config.Config
-	render *preview.Renderer
+	Store    *store.Store
+	Searcher Searcher // optional; nil = keyword search only
+	cfg      *config.Config
+	render   *preview.Renderer
 }
 
 func NewLocal(st *store.Store, cfg *config.Config) *Local {
@@ -30,6 +37,12 @@ func (l *Local) Name() string    { return model.SourceLocal }
 func (l *Local) Available() bool { return true }
 
 func (l *Local) Search(ctx context.Context, q model.Query) ([]model.Asset, error) {
+	if l.Searcher != nil {
+		return l.Searcher.Search(ctx, q)
+	}
+	if (q.Image != "" && q.Text == "") || q.StyleRef != "" {
+		return nil, fmt.Errorf("image and style search need semantic search: set embedding.endpoint (see modon help)")
+	}
 	return l.Store.Search(q)
 }
 

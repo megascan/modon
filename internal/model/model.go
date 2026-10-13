@@ -56,21 +56,35 @@ type Asset struct {
 	Rating      float64 `json:"rating,omitempty"`
 	ReviewCount int     `json:"review_count,omitempty"`
 
+	// Search diagnostics: fused relevance (higher is better) and which
+	// signals matched (keyword, text, image).
+	Score     float64  `json:"score,omitempty"`
+	MatchedBy []string `json:"matched_by,omitempty"`
+	// Similarity is the raw preview-vs-preview cosine in find_similar
+	// results (1.0 = identical thumbnail).
+	Similarity float64 `json:"similarity,omitempty"`
+
 	RowID int64 `json:"-"` // local index row id
 }
 
 // Query is a normalized search request. Fields with no value are ignored.
 type Query struct {
-	Text      string   // free text
-	Tags      []string // extra keywords that must/may match
-	Category  string
-	Style     string
-	AssetType string
-	Animated  *bool
-	Free      *bool
-	MinPrice  float64
-	MaxPrice  float64 // 0 = no limit
-	Limit     int
+	Text  string // free text
+	Image string // query-by-image: local path, http(s) URL or data: URL (local index only)
+	// StyleRef re-ranks results toward a look: an image (path, URL, data:
+	// URL) or "local:<id>" of an owned asset. StyleWeight 0..1 sets how much
+	// the look counts against relevance (0 = default 0.5).
+	StyleRef    string
+	StyleWeight float64
+	Tags        []string // extra keywords that must/may match
+	Category    string
+	Style       string
+	AssetType   string
+	Animated    *bool
+	Free        *bool
+	MinPrice    float64
+	MaxPrice    float64 // 0 = no limit
+	Limit       int
 }
 
 // DownloadResult describes the outcome of a download call. Status is one of
