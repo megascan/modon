@@ -335,14 +335,14 @@ func TestRankZFloor(t *testing.T) {
 	m.Vecs = append(m.Vecs, fakeVec("red sports car")...)
 	q := fakeVec("task: search result | query: sports car")
 
-	hits := rank(m, q, nil, nil, 0, 3, 10)
+	hits := rank(m, q, nil, 0, 3, 10)
 	if len(hits) != 1 || hits[0].id != 999 {
 		t.Fatalf("z-floor hits = %+v, want only 999", hits)
 	}
-	if hits := rank(m, q, nil, map[int64]bool{999: true, 5: true}, 0, 3, 10); len(hits) != 1 {
+	if hits := rank(m, q, map[int64]bool{999: true, 5: true}, 0, 3, 10); len(hits) != 1 {
 		t.Fatalf("filtered z-floor hits = %+v", hits)
 	}
-	if hits := rank(m, q, nil, nil, 999, 0, 10); len(hits) != 10 {
+	if hits := rank(m, q, nil, 999, 0, 10); len(hits) != 10 {
 		t.Fatalf("no floor should return k hits, got %d", len(hits))
 	}
 }

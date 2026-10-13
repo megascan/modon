@@ -141,7 +141,7 @@ type Suggestions struct {
 
 // ConfidentMargin is the category score gap above which auto-classification
 // fills an empty category (calibrated with `modon embed --eval`).
-const ConfidentMargin = 0.035
+const ConfidentMargin = 0.05
 
 type scorer struct {
 	ls         *labelSet

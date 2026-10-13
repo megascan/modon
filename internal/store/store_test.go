@@ -142,3 +142,33 @@ func TestSearchModeReportsStrictness(t *testing.T) {
 		}
 	}
 }
+
+// A long-running MCP server must see vectors another process (modon embed)
+// writes to the same index.
+func TestVectorCacheSeesOtherProcesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	server, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	cli, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	id, err := cli.Upsert(model.Asset{PrimaryFile: "/tmp/x.obj", Title: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := server.Vectors(VecImage, "m", 2); len(m.IDs) != 0 {
+		t.Fatal("expected an empty matrix first")
+	}
+	if err := cli.PutVector(id, VecImage, "m", "h", []float32{1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := server.Vectors(VecImage, "m", 2); len(m.IDs) != 1 {
+		t.Fatalf("cache did not pick up another connection's write: %d rows", len(m.IDs))
+	}
+}

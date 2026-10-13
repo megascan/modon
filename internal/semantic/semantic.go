@@ -28,8 +28,9 @@ import (
 // query's score distribution over the whole corpus. The largest of n
 // unrelated scores already reaches z ~ sqrt(2 ln n), so the cut scales with
 // library size: about 3.0 for 500 assets, 4.0 for 25k. Measured on a 24.5k
-// library, gibberish queries keep 0-7 text hits at that cut while real
-// queries keep tens to hundreds.
+// library (text documents and preview images alike), gibberish queries keep
+// 0-7 hits per signal at that cut while real queries keep their matches.
+// Raw cosines separated better than baseline-corrected ones at that scale.
 const (
 	rrfK     = 60.0
 	poolSize = 100 // candidates per signal before fusion
@@ -54,10 +55,6 @@ func usable(m, other *store.Matrix) bool {
 	return len(m.IDs) >= minRowsForZ || len(other.IDs) < minRowsForZ
 }
 
-// neutralQueries define the "query about nothing in particular" whose
-// similarity to each asset is subtracted from real query scores.
-var neutralQueries = []string{"", "a 3D model", "an object", "a thing", "asset"}
-
 // Engine owns the embedding client and the in-memory ranking state.
 type Engine struct {
 	cfg *config.Config
@@ -65,8 +62,6 @@ type Engine struct {
 	cl  *embed.Client
 
 	mu        sync.Mutex
-	neutral   []float32
-	bias      map[*store.Matrix][]float32
 	queries   map[string][]float32 // small cache of recent query vectors
 	downUntil time.Time
 	lastErr   string
@@ -76,7 +71,7 @@ type Engine struct {
 
 // New builds the engine; it is inert when embedding.endpoint is unset.
 func New(cfg *config.Config, st *store.Store) *Engine {
-	e := &Engine{cfg: cfg, st: st, bias: map[*store.Matrix][]float32{}, queries: map[string][]float32{}}
+	e := &Engine{cfg: cfg, st: st, queries: map[string][]float32{}}
 	ec := cfg.Embedding
 	if ec.Endpoint != "" {
 		e.cl = embed.New(ec.Endpoint, ec.Model, ec.Dims, time.Duration(ec.TimeoutSeconds)*time.Second)
@@ -186,75 +181,16 @@ func (e *Engine) queryVec(ctx context.Context, text string) ([]float32, error) {
 	return v, nil
 }
 
-func (e *Engine) neutralVec(ctx context.Context) ([]float32, error) {
-	e.mu.Lock()
-	if e.neutral != nil {
-		v := e.neutral
-		e.mu.Unlock()
-		return v, nil
-	}
-	e.mu.Unlock()
-	ins := make([]embed.Input, len(neutralQueries))
-	for i, q := range neutralQueries {
-		ins[i] = embed.Input{Text: embed.Query(q)}
-	}
-	vs, err := e.cl.Embed(ctx, ins)
-	if err != nil {
-		return nil, err
-	}
-	mean := make([]float32, e.dims())
-	for _, v := range vs {
-		for i, x := range v {
-			mean[i] += x
-		}
-	}
-	mean, err = embed.Fit(mean, e.dims())
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	e.neutral = mean
-	e.mu.Unlock()
-	return mean, nil
-}
-
-// baseline returns each row's similarity to the neutral query, cached per
-// loaded matrix.
-func (e *Engine) baseline(ctx context.Context, m *store.Matrix) ([]float32, error) {
-	e.mu.Lock()
-	if b, ok := e.bias[m]; ok {
-		e.mu.Unlock()
-		return b, nil
-	}
-	e.mu.Unlock()
-	nv, err := e.neutralVec(ctx)
-	if err != nil {
-		return nil, err
-	}
-	b := make([]float32, len(m.IDs))
-	for i := range m.IDs {
-		b[i] = embed.Dot(nv, m.Vecs[i*m.Dims:(i+1)*m.Dims])
-	}
-	e.mu.Lock()
-	if len(e.bias) > 8 { // matrices are replaced after writes; drop stale ones
-		e.bias = map[*store.Matrix][]float32{}
-	}
-	e.bias[m] = b
-	e.mu.Unlock()
-	return b, nil
-}
-
 type hit struct {
 	id    int64
 	score float32
 }
 
-// rank scores every row against v and returns the top k. bias (may be nil)
-// is subtracted per row. With minZ > 0, rows scoring less than minZ
+// rank scores every row against v and returns the top k. With minZ > 0, rows scoring less than minZ
 // standard deviations above the corpus mean are dropped; the statistics use
 // every row so facet filters do not shift the cut. Rows outside allowed
 // (when non-nil) and the excluded id are skipped.
-func rank(m *store.Matrix, v []float32, bias []float32, allowed map[int64]bool, exclude int64, minZ float64, k int) []hit {
+func rank(m *store.Matrix, v []float32, allowed map[int64]bool, exclude int64, minZ float64, k int) []hit {
 	if m == nil || len(m.IDs) == 0 || len(v) != m.Dims {
 		return nil
 	}
@@ -262,9 +198,6 @@ func rank(m *store.Matrix, v []float32, bias []float32, allowed map[int64]bool, 
 	var sum, sumSq float64
 	for i := range m.IDs {
 		s := embed.Dot(v, m.Vecs[i*m.Dims:(i+1)*m.Dims])
-		if bias != nil {
-			s -= bias[i]
-		}
 		scores[i] = s
 		sum += float64(s)
 		sumSq += float64(s) * float64(s)
@@ -512,18 +445,11 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 			e.fail(err)
 			return e.st.Search(q)
 		}
-		// Text documents are scored raw; preview images are corrected by
-		// their similarity to a neutral query, because cross-modal scores
-		// carry a large per-image offset (every thumbnail is "a 3D model").
-		ib, err := e.baseline(ctx, imageM)
-		if err != nil {
-			return e.st.Search(q)
-		}
 		if usable(textM, imageM) {
-			signals = append(signals, signal{"text", 1, hitIDs(rank(textM, qv, nil, allowed, 0, zFloor(len(textM.IDs)), poolSize))})
+			signals = append(signals, signal{"text", 1, hitIDs(rank(textM, qv, allowed, 0, zFloor(len(textM.IDs)), poolSize))})
 		}
 		if usable(imageM, textM) {
-			signals = append(signals, signal{"image", 1, hitIDs(rank(imageM, qv, ib, allowed, 0, zFloor(len(imageM.IDs)), poolSize))})
+			signals = append(signals, signal{"image", 1, hitIDs(rank(imageM, qv, allowed, 0, zFloor(len(imageM.IDs)), poolSize))})
 		}
 	}
 	if q.Image != "" {
@@ -537,8 +463,8 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 			return e.fuseZ([]zpart{{"image", 1, imageM, iv}, {"text", 0.3, textM, iv}}, allowed, 0, limit)
 		}
 		signals = append(signals,
-			signal{"image", 1.5, hitIDs(rank(imageM, iv, nil, allowed, 0, 0, poolSize))},
-			signal{"text", 0.5, hitIDs(rank(textM, iv, nil, allowed, 0, 0, poolSize))})
+			signal{"image", 1.5, hitIDs(rank(imageM, iv, allowed, 0, 0, poolSize))},
+			signal{"text", 0.5, hitIDs(rank(textM, iv, allowed, 0, 0, poolSize))})
 	}
 	if sv == nil {
 		return e.fuse(signals, limit)

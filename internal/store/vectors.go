@@ -58,7 +58,8 @@ type vecCache struct {
 }
 
 type cachedMatrix struct {
-	gen uint64
+	gen uint64 // this process's vector writes
+	dv  int64  // PRAGMA data_version: commits by other processes
 	m   *Matrix
 }
 
@@ -101,12 +102,18 @@ func (s *Store) VectorHashes(kind, modelID string, dims int) (map[int64]string, 
 }
 
 // Vectors returns the cached matrix for a kind/model/dims, reloading it from
-// SQLite after any write.
+// SQLite after any write — including writes by other modon processes (a
+// CLI `modon embed` while an MCP server is running), which SQLite's
+// data_version reports.
 func (s *Store) Vectors(kind, modelID string, dims int) (*Matrix, error) {
 	key := fmt.Sprintf("%s|%s|%d", kind, modelID, dims)
+	var dv int64
+	if err := s.db.QueryRow(`PRAGMA data_version`).Scan(&dv); err != nil {
+		return nil, err
+	}
 	s.vc.mu.Lock()
 	gen := s.vc.gen
-	if c, ok := s.vc.mats[key]; ok && c.gen == gen {
+	if c, ok := s.vc.mats[key]; ok && c.gen == gen && c.dv == dv {
 		s.vc.mu.Unlock()
 		return c.m, nil
 	}
@@ -135,7 +142,7 @@ func (s *Store) Vectors(kind, modelID string, dims int) (*Matrix, error) {
 	if s.vc.mats == nil {
 		s.vc.mats = map[string]*cachedMatrix{}
 	}
-	s.vc.mats[key] = &cachedMatrix{gen: gen, m: m}
+	s.vc.mats[key] = &cachedMatrix{gen: gen, dv: dv, m: m}
 	s.vc.mu.Unlock()
 	return m, nil
 }

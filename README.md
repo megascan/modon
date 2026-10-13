@@ -183,10 +183,10 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   brute force in memory (tens of thousands of assets in milliseconds).
 - **Scoring.** A vector hit must stand out from the query's score
   distribution over the whole corpus: z ≥ √(2 ln n) − 0.5 (≈3 for 500
-  assets, ≈4 for 25k), which leaves gibberish queries with 0–7 hits on a
-  24.5k library. Preview scores are first corrected by each image's
-  similarity to a neutral query (cross-modal scores carry a large
-  per-image offset). A signal covering too few assets (e.g. 2 previews in
+  assets, ≈4 for 25k), which leaves gibberish queries with 0–10 hits on a
+  24.5k library with full thumbnail coverage, for text and preview signals
+  alike (raw cosines separated better than neutral-query-corrected ones at
+  that scale). A signal covering too few assets (e.g. 2 previews in
   a 24k library) is ignored. Facet filters (category/style/tags/animated/
   type) apply to vector hits too. Task prefixes follow the model card (`task: search result |
   query: …` / `title: … | text: …`; images unprefixed).
@@ -205,13 +205,15 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   cosine. Workbench thumbnails share background/camera/lighting, so
   unrelated previews still sit around 0.8: read `similarity` as a
   tiebreaker, and ≳0.97 as "probably the same model".
-- **Zero-shot labels are hints.** On a 2,095-asset sample (Synty packs,
-  untextured Workbench renders) image-only category guesses agreed with the
-  importer's filename heuristic 47% top-1 / 68% top-3 over 28 categories,
-  and ~80% at the `--classify` default margin (0.035, about a third of
-  assets) — partly because the heuristic itself is noisy (e.g. police
-  officers filed under *creature*). `--classify` only fills *empty*
-  categories and is a dry run unless `--apply`.
+- **Zero-shot labels are hints.** Image-only category guesses agreed with
+  the importer's filename heuristic 47% top-1 / 68% top-3 on a stratified
+  2,095-asset sample, and 40% / 57% over a full 24.5k Synty-heavy library
+  (11.3k categorized assets, dominated by character pieces, modular walls
+  and building parts where the heuristic is noisy too, e.g. police officers
+  filed under *creature*). Agreement rises with the confidence margin: 75%
+  at the `--classify` default (0.05, ~18% of assets). `--classify` only
+  fills *empty* categories and is a dry run unless `--apply`; treat
+  `suggest_metadata` as a hint for agents writing real descriptions.
 - **Images need previews.** Run `modon embed --render` (Blender/f3d,
   `preview.workers` in parallel) or `import --previews`; assets without one
   are still found through their text vector. Blender renders in batches of
