@@ -203,7 +203,13 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   categories and is a dry run unless `--apply`.
 - **Images need previews.** Run `modon embed --render` (Blender/f3d,
   `preview.workers` in parallel) or `import --previews`; assets without one
-  are still found through their text vector.
+  are still found through their text vector. Blender renders in batches of
+  25 per session (~0.2 s/asset instead of ~3.6 s with a Blender launch per
+  file); a crash or 2-minute stall fails just that asset. Textures whose
+  stored paths point at the artist's machine are relinked by name from the
+  asset's folder and its parents (e.g. `Texture_01.psd` → shipped
+  `Texture_01_A.png`); still-missing ones render in material colours
+  instead of Blender's magenta.
 
 ## How it works
 

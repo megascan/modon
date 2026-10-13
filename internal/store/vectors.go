@@ -216,6 +216,24 @@ func (s *Store) All() ([]model.Asset, error) {
 	return collect(rows), nil
 }
 
+// PreviewFailed returns the ids whose thumbnail render already failed, so
+// backfills do not retry them every run.
+func (s *Store) PreviewFailed() (map[int64]bool, error) {
+	rows, err := s.db.Query(`SELECT id FROM assets WHERE preview_status = 'failed'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			out[id] = true
+		}
+	}
+	return out, rows.Err()
+}
+
 // SetClassification fills category/style where the agent or importer left
 // them empty; existing values are kept.
 func (s *Store) SetClassification(id int64, category, style string) error {

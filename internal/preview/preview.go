@@ -4,8 +4,11 @@
 package preview
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -111,6 +114,148 @@ func (r *Renderer) Render(ctx context.Context, assetPath, outPNG string, size in
 		return fmt.Errorf("preview render produced no output")
 	}
 	return nil
+}
+
+// Job is one thumbnail to render.
+type Job struct {
+	Asset string
+	Out   string
+}
+
+var (
+	startRe = regexp.MustCompile(`^MODON_PREVIEW_START:(\d+)`)
+	errRe   = regexp.MustCompile(`^MODON_PREVIEW_ERROR:(\d+):(.*)`)
+)
+
+// RenderBatch renders many thumbnails, calling done once per job with its
+// error (nil on success). Blender renders them in one session per batch,
+// which removes the per-file startup cost; if Blender crashes or stalls on
+// one asset, that job fails and the rest are retried in a fresh session.
+// f3d renders one file at a time.
+func (r *Renderer) RenderBatch(ctx context.Context, jobs []Job, size int, done func(Job, error)) {
+	if r.Available() != "blender" {
+		for _, j := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			done(j, r.Render(ctx, j.Asset, j.Out, size))
+		}
+		return
+	}
+	for len(jobs) > 0 && ctx.Err() == nil {
+		next := r.blenderBatch(ctx, jobs, size, done)
+		if next >= len(jobs) {
+			return
+		}
+		jobs = jobs[next:]
+	}
+}
+
+// stallTimeout bounds a single asset inside a batch.
+const stallTimeout = 2 * time.Minute
+
+// blenderBatch runs one Blender session over jobs and returns how many jobs
+// were settled (done called); the caller retries from there.
+func (r *Renderer) blenderBatch(ctx context.Context, jobs []Job, size int, done func(Job, error)) int {
+	pairs := make([][2]string, len(jobs))
+	for i, j := range jobs {
+		pairs[i] = [2]string{j.Asset, j.Out}
+	}
+	f, err := os.CreateTemp("", "modon-preview-*.json")
+	if err != nil {
+		for _, j := range jobs {
+			done(j, err)
+		}
+		return len(jobs)
+	}
+	defer os.Remove(f.Name())
+	_ = json.NewEncoder(f).Encode(pairs)
+	f.Close()
+
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, r.blender, "--background", "--factory-startup",
+		"--python", scriptPath(), "--", "--batch", f.Name(), strconv.Itoa(size))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		for _, j := range jobs {
+			done(j, err)
+		}
+		return len(jobs)
+	}
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		for _, j := range jobs {
+			done(j, err)
+		}
+		return len(jobs)
+	}
+
+	// Watchdog: kill the session when one asset takes too long.
+	progress := make(chan struct{}, 1)
+	go func() {
+		t := time.NewTimer(stallTimeout)
+		defer t.Stop()
+		for {
+			select {
+			case <-cctx.Done():
+				return
+			case <-progress:
+				t.Reset(stallTimeout)
+			case <-t.C:
+				cancel()
+				return
+			}
+		}
+	}()
+
+	settled, current := 0, -1
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if m := startRe.FindStringSubmatch(line); m != nil {
+			current, _ = strconv.Atoi(m[1])
+			select {
+			case progress <- struct{}{}:
+			default:
+			}
+			continue
+		}
+		if m := outRe.FindStringSubmatch(line); m != nil && current >= 0 && current < len(jobs) {
+			done(jobs[current], nil)
+			settled = current + 1
+			continue
+		}
+		if m := errRe.FindStringSubmatch(line); m != nil {
+			i, _ := strconv.Atoi(m[1])
+			if i >= 0 && i < len(jobs) {
+				done(jobs[i], fmt.Errorf("preview render failed (blender): %s", strings.TrimSpace(m[2])))
+				settled = i + 1
+			}
+		}
+	}
+	werr := cmd.Wait()
+	if settled >= len(jobs) || ctx.Err() != nil {
+		return settled
+	}
+	// The session died (crash, stall, OOM) on the job it was working on.
+	reason := "blender exited"
+	switch {
+	case errors.Is(cctx.Err(), context.Canceled) && ctx.Err() == nil:
+		reason = fmt.Sprintf("stalled for %s", stallTimeout)
+	case werr != nil:
+		reason = werr.Error()
+	}
+	if current >= settled && current < len(jobs) {
+		done(jobs[current], fmt.Errorf("preview render failed (blender): %s", reason))
+		return current + 1
+	}
+	// Died before starting any job: fail them all rather than loop.
+	for _, j := range jobs[settled:] {
+		done(j, fmt.Errorf("preview render failed (blender): %s", reason))
+	}
+	return len(jobs)
 }
 
 // scriptPath materializes the embedded script into the cache dir.

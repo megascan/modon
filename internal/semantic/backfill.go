@@ -269,9 +269,13 @@ func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStat
 
 func (e *Engine) embedImages(ctx context.Context, assets []model.Asset, o BackfillOptions, stats *BackfillStats, progress func(string, int, int)) error {
 	if o.Render {
+		failed, err := e.st.PreviewFailed()
+		if err != nil {
+			return err
+		}
 		var missing []int64
 		for _, a := range assets {
-			if e.imageHash(a) == "" {
+			if e.imageHash(a) == "" && !failed[a.RowID] {
 				missing = append(missing, a.RowID)
 			}
 		}
