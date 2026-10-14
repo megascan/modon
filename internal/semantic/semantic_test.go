@@ -187,7 +187,7 @@ func TestBackfillIsIncremental(t *testing.T) {
 		t.Fatalf("second run should be a no-op: %+v", s)
 	}
 	// Editing metadata re-embeds just that asset's text.
-	if _, err := f.st.UpdateMetadata(f.ids["rock big"], "a huge granite boulder", "", "", "", nil); err != nil {
+	if _, err := f.st.UpdateMetadata(f.ids["rock big"], store.MetadataUpdate{Description: "a huge granite boulder"}); err != nil {
 		t.Fatal(err)
 	}
 	s, err = f.eng.Backfill(ctx, BackfillOptions{Text: true, Images: true})

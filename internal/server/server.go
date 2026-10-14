@@ -92,7 +92,7 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_assets",
-		Description: "Search 3D mesh assets across owned/local index first, then poly.pizza and Fab. Supports free-text, tags, category, style, asset type, animation filter, price range and source selection. With semantic search enabled, local results are ranked by meaning and by what the preview thumbnail looks like (EmbeddingGemma 2), so descriptive queries like 'mossy stone ruin' find badly named files; pass image to search the local index by a reference picture, or style_reference (an image or an asset id such as one already used in the scene) to keep results in a consistent art style. Local hits carry score and matched_by (keyword/text/image). Paid results are flagged purchase_required per config (ask/allow/deny) so the agent can ask the user before buying.",
+		Description: "Search 3D mesh assets across owned/local index first, then poly.pizza and Fab. Supports free-text, tags, category, style, asset type, animation filter, price range and source selection. With semantic search enabled, local results are ranked by meaning and by what the preview thumbnail looks like (EmbeddingGemma 2), so descriptive queries like 'mossy stone ruin' find badly named files; pass image to search the local index by a reference picture, or style_reference (an image or an asset id such as one already used in the scene) to keep results in a consistent art style. Local hits carry score and matched_by (keyword/text/image); copies of one model (FBX + OBJ exports, props shared between packs) are collapsed into the best-ranked one with cluster_id and a duplicates list (set expand_duplicates to get every copy). Paid results are flagged purchase_required per config (ask/allow/deny) so the agent can ask the user before buying.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, any, error) {
 		return handleSearch(ctx, d, in)
 	})
@@ -148,21 +148,21 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "update_asset_metadata",
-		Description: "Enrich a local asset with a rich description, category, art-style descriptors, tags or asset type. Clears needs_review once a description exists. Use after reviewing list_unclassified results.",
+		Description: "Write metadata for local assets: description, category, art-style descriptors, tags, asset type. Fields you write are recorded as agent-written (provenance) and survive re-imports; heuristic values never overwrite them. Tags merge by default; tags_mode=replace makes tags the complete list, remove_tags deletes tags. Pass ids to tag several assets at once and apply_to_duplicates to copy the edit to every copy in the asset's duplicate cluster. needs_review clears once a description exists, or a category plus tags; this also releases any list_unclassified claim on the asset.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in UpdateMetadataInput) (*mcp.CallToolResult, any, error) {
 		return handleUpdateMetadata(ctx, d, in)
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_unclassified",
-		Description: "List local assets that still need review (no rich description yet), largest files first.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in LimitInput) (*mcp.CallToolResult, any, error) {
+		Description: "List local assets that still need review, largest files first. Page with offset. For parallel tagging, pass worker (any id unique to you): the returned assets are claimed for you for lease_seconds (default 900) and other workers get disjoint batches; claims are released as you update each asset, and release=true drops your remaining claims. one_per_cluster returns one representative per duplicate cluster (its duplicates are listed and claimed too) so you can tag it once with apply_to_duplicates.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
 		return handleUnclassified(ctx, d, in)
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "index_stats",
-		Description: "Show local index statistics (totals, needs_review count, breakdowns by type/category/style, animated count, FTS status) plus server config status (which sources/credentials are configured).",
+		Description: "Show local index statistics (totals, needs_review count, breakdowns by type/category/style, animated count, duplicate clusters, agent-edited assets, active review claims, FTS status), the semantic layer (embedding server reachability checked live, device, vectors) and config status (which sources/credentials are configured).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in EmptyInput) (*mcp.CallToolResult, any, error) {
 		return handleStats(ctx, d, in)
 	})
@@ -187,6 +187,8 @@ type SearchInput struct {
 
 	StyleReference string  `json:"style_reference,omitempty" jsonschema:"Keep a consistent look: owned results are re-ranked toward this reference while the query text still decides what the object is. An image path/URL, local:<id> of an owned asset (e.g. one already in the scene), or a polypizza:/fab: id (its preview is used). Needs semantic search."`
 	StyleWeight    float64 `json:"style_weight,omitempty" jsonschema:"How much the reference look counts versus relevance, 0..1 (default 0.5; higher = stricter style match)"`
+
+	ExpandDuplicates bool `json:"expand_duplicates,omitempty" jsonschema:"Return every copy of a model (FBX and OBJ exports, the same prop in several packs) instead of collapsing each duplicate cluster into its best-ranked member"`
 }
 
 type SimilarInput struct {
@@ -226,16 +228,26 @@ type ImportInput struct {
 }
 
 type UpdateMetadataInput struct {
-	ID          string   `json:"id" jsonschema:"Local asset id: local:<rowid>"`
-	Description string   `json:"description,omitempty" jsonschema:"Rich description of the asset"`
-	Category    string   `json:"category,omitempty" jsonschema:"Canonical category, e.g. chair, vehicle, character"`
-	Style       string   `json:"style,omitempty" jsonschema:"Art-style descriptors, e.g. lowpoly, stylized"`
-	AssetType   string   `json:"asset_type,omitempty" jsonschema:"One of model, animation, material, texture, other"`
-	Tags        []string `json:"tags,omitempty" jsonschema:"Tags to merge into the asset"`
+	ID                string   `json:"id,omitempty" jsonschema:"Local asset id: local:<rowid>"`
+	IDs               []string `json:"ids,omitempty" jsonschema:"Several local asset ids that get the same edit (instead of id)"`
+	Description       string   `json:"description,omitempty" jsonschema:"Rich description of the asset"`
+	Category          string   `json:"category,omitempty" jsonschema:"Canonical category, e.g. chair, vehicle, character"`
+	Style             string   `json:"style,omitempty" jsonschema:"Art-style descriptors, e.g. lowpoly, stylized"`
+	AssetType         string   `json:"asset_type,omitempty" jsonschema:"One of model, animation, material, texture, other"`
+	Tags              []string `json:"tags,omitempty" jsonschema:"Tags to add (tags_mode merge, default) or the complete tag list (tags_mode replace)"`
+	TagsMode          string   `json:"tags_mode,omitempty" jsonschema:"merge (default): add tags to the current list; replace: tags becomes the whole list (an empty list clears it)"`
+	RemoveTags        []string `json:"remove_tags,omitempty" jsonschema:"Tags to delete (case-insensitive), applied after merge/replace"`
+	ApplyToDuplicates bool     `json:"apply_to_duplicates,omitempty" jsonschema:"Also apply the edit to every other copy in each asset's duplicate cluster"`
+	Reviewed          *bool    `json:"reviewed,omitempty" jsonschema:"Force needs_review off (true) or on (false); by default it clears once a description, or a category plus tags, exists"`
 }
 
-type LimitInput struct {
-	Limit int `json:"limit,omitempty" jsonschema:"Max rows to return, default 20"`
+type UnclassifiedInput struct {
+	Limit         int    `json:"limit,omitempty" jsonschema:"Max rows to return, default 20"`
+	Offset        int    `json:"offset,omitempty" jsonschema:"Skip this many rows (paging without claims)"`
+	Worker        string `json:"worker,omitempty" jsonschema:"Your worker id: claim the returned assets so parallel agents get disjoint batches"`
+	LeaseSeconds  int    `json:"lease_seconds,omitempty" jsonschema:"How long claims last, default 900"`
+	OnePerCluster bool   `json:"one_per_cluster,omitempty" jsonschema:"One representative per duplicate cluster; its duplicates are listed (and claimed with worker)"`
+	Release       bool   `json:"release,omitempty" jsonschema:"With worker: release your remaining claims instead of listing"`
 }
 
 type EmptyInput struct{}
@@ -252,6 +264,8 @@ func handleSearch(ctx context.Context, d *Deps, in SearchInput) (*mcp.CallToolRe
 		Animated:  in.Animated,
 		Limit:     in.Limit,
 		Image:     in.Image,
+
+		ExpandDuplicates: in.ExpandDuplicates,
 
 		StyleWeight: in.StyleWeight,
 	}
@@ -393,6 +407,11 @@ func handleImport(ctx context.Context, d *Deps, in ImportInput) (*mcp.CallToolRe
 		return errResult(err), nil, nil
 	}
 	payload := map[string]any{"import": stats}
+	if !d.Sem.Enabled() {
+		if ds, err := semantic.Dedupe(d.St, nil); err == nil {
+			payload["duplicates"] = ds
+		}
+	}
 	if d.Sem.Enabled() {
 		if es, err := d.Sem.Backfill(ctx, semantic.BackfillOptions{Text: true, Images: true}); err != nil {
 			payload["embedding_error"] = err.Error()
@@ -407,38 +426,115 @@ func handleImport(ctx context.Context, d *Deps, in ImportInput) (*mcp.CallToolRe
 }
 
 func handleUpdateMetadata(ctx context.Context, d *Deps, in UpdateMetadataInput) (*mcp.CallToolResult, any, error) {
-	src, rid, err := source.SplitID(in.ID)
+	refs := in.IDs
+	if in.ID != "" {
+		refs = append([]string{in.ID}, refs...)
+	}
+	if len(refs) == 0 {
+		return errResult(fmt.Errorf("id (or ids) is required, e.g. local:3")), nil, nil
+	}
+	u := store.MetadataUpdate{
+		Description: in.Description, Category: in.Category, Style: in.Style, AssetType: in.AssetType,
+		Tags: in.Tags, TagsMode: in.TagsMode, RemoveTags: in.RemoveTags, Reviewed: in.Reviewed,
+	}
+	updated, err := UpdateMetadata(ctx, d, refs, u, in.ApplyToDuplicates)
 	if err != nil {
 		return errResult(err), nil, nil
 	}
-	if src != model.SourceLocal {
-		return errResult(fmt.Errorf("only local assets can be edited, got %q", in.ID)), nil, nil
+	var payload any = map[string]any{"updated": len(updated), "assets": updated}
+	if len(updated) == 1 {
+		payload = updated[0] // single edits keep the original response shape
 	}
-	rowID, err := strconv.ParseInt(rid, 10, 64)
-	if err != nil {
-		return errResult(fmt.Errorf("local asset ids are numeric, got %q", in.ID)), nil, nil
-	}
-	a, err := d.St.UpdateMetadata(rowID, in.Description, in.Category, in.Style, in.AssetType, in.Tags)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	d.Sem.Refresh(ctx, rowID)
-	text, _ := json.MarshalIndent(a, "", "  ")
+	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
-	}, a, nil
+	}, payload, nil
 }
 
-func handleUnclassified(_ context.Context, d *Deps, in LimitInput) (*mcp.CallToolResult, any, error) {
-	limit := in.Limit
-	if limit <= 0 {
-		limit = 20
+// UpdateMetadata applies one agent edit to local assets (and, with
+// duplicates, to every copy in their clusters), then re-embeds them.
+func UpdateMetadata(ctx context.Context, d *Deps, refs []string, u store.MetadataUpdate, duplicates bool) ([]model.Asset, error) {
+	if u.Empty() {
+		return nil, fmt.Errorf("nothing to update: pass description, category, style, asset_type, tags, remove_tags or reviewed")
 	}
-	assets, err := d.St.ListUnclassified(limit)
+	var ids []int64
+	seen := map[int64]bool{}
+	add := func(id int64) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, ref := range refs {
+		id, err := LocalID(ref)
+		if err != nil {
+			return nil, err
+		}
+		add(id)
+		if duplicates {
+			a, err := d.St.GetByID(id)
+			if err != nil {
+				return nil, err
+			}
+			members, err := d.St.ClusterMembers(a.ClusterID)
+			if err != nil {
+				return nil, err
+			}
+			for _, m := range members {
+				add(m)
+			}
+		}
+	}
+	out := make([]model.Asset, 0, len(ids))
+	for _, id := range ids {
+		a, err := d.St.UpdateMetadata(id, u)
+		if err != nil {
+			return out, fmt.Errorf("local:%d: %w", id, err)
+		}
+		out = append(out, a)
+	}
+	d.Sem.Refresh(ctx, ids...)
+	return out, nil
+}
+
+// LocalID parses "local:<rowid>".
+func LocalID(ref string) (int64, error) {
+	src, rid, err := source.SplitID(ref)
 	if err != nil {
-		return errResult(err), nil, nil
+		return 0, err
 	}
-	payload := map[string]any{"count": len(assets), "assets": assets}
+	if src != model.SourceLocal {
+		return 0, fmt.Errorf("only local assets can be edited, got %q", ref)
+	}
+	id, err := strconv.ParseInt(rid, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("local asset ids are numeric, got %q", ref)
+	}
+	return id, nil
+}
+
+func handleUnclassified(_ context.Context, d *Deps, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
+	var payload any
+	if in.Release {
+		n, err := d.St.ReleaseClaims(in.Worker)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		payload = map[string]any{"worker": in.Worker, "released": n}
+	} else {
+		page, err := d.St.ListUnclassified(store.UnclassifiedOptions{
+			Limit: in.Limit, Offset: in.Offset, Worker: in.Worker,
+			Lease: time.Duration(in.LeaseSeconds) * time.Second, OnePerCluster: in.OnePerCluster,
+		})
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		m := map[string]any{"count": len(page.Assets), "assets": page.Assets, "remaining": page.Remaining}
+		if page.Worker != "" {
+			m["worker"], m["lease_expires_at"] = page.Worker, page.LeaseExpiresAt
+		}
+		payload = m
+	}
 	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},

@@ -67,11 +67,11 @@ func TestUpdateMetadataClearsReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	un, err := st.ListUnclassified(10)
-	if err != nil || len(un) != 1 {
+	un, err := st.ListUnclassified(UnclassifiedOptions{Limit: 10})
+	if err != nil || len(un.Assets) != 1 {
 		t.Fatalf("expected 1 unclassified, got %v %+v", err, un)
 	}
-	updated, err := st.UpdateMetadata(id, "a rich description", "chair", "lowpoly", "model", []string{"wood"})
+	updated, err := st.UpdateMetadata(id, MetadataUpdate{Description: "a rich description", Category: "chair", Style: "lowpoly", AssetType: "model", Tags: []string{"wood"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,9 +81,9 @@ func TestUpdateMetadataClearsReview(t *testing.T) {
 	if updated.Category != "chair" || updated.Style != "lowpoly" {
 		t.Fatalf("metadata not stored: %+v", updated)
 	}
-	un, _ = st.ListUnclassified(10)
-	if len(un) != 0 {
-		t.Fatalf("expected 0 unclassified, got %d", len(un))
+	un, _ = st.ListUnclassified(UnclassifiedOptions{Limit: 10})
+	if len(un.Assets) != 0 || un.Remaining != 0 {
+		t.Fatalf("expected 0 unclassified, got %+v", un)
 	}
 }
 

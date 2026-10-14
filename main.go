@@ -68,6 +68,12 @@ func main() {
 		err = cmdEmbedServer(args)
 	case "service":
 		err = cmdService(args)
+	case "unclassified":
+		err = cmdUnclassified(args)
+	case "update":
+		err = cmdUpdate(args)
+	case "dedupe":
+		err = cmdDedupe(args)
 	case "similar":
 		err = cmdSimilar(args)
 	case "suggest":
@@ -110,6 +116,9 @@ Usage:
                                 Keep the embedding server up as a systemd user unit
   modon similar [flags] <id>    Owned assets that look like <id> (local or remote)
   modon suggest <id>            Zero-shot category/style guesses for a local asset
+  modon unclassified [flags]    Review queue: page, claim batches for a worker
+  modon update [flags] <id>...  Write agent metadata (tags merge/replace/remove)
+  modon dedupe                  Recompute duplicate clusters (FBX/OBJ copies, shared props)
   modon config [get|set|path]   Inspect or change configuration
   modon stats                   Local index statistics + config status
   modon help | version
@@ -133,6 +142,7 @@ Search flags:
   --image PATH|URL                query the local index by a reference picture
   --style-ref REF --style-weight F  keep a look: re-rank owned hits toward an image
                                   or asset id (local:N, fab:..); weight 0..1 (0.5)
+  --expand                        list every copy of a model (default: duplicates collapsed)
 
 Semantic search (EmbeddingGemma 2):
   modon config set embedding.endpoint http://127.0.0.1:8178
@@ -149,6 +159,15 @@ Embed-server flags:
   One server per machine: a second embed-server exits when one is running.
   Clients with embedding.autostart reuse it, or start the systemd unit
   (modon service install) / a detached server when it is missing.
+
+Unclassified flags (bulk tagging):
+  --limit N --offset N --worker ID --lease 15m --one-per-cluster --json
+  --release (with --worker: drop that worker's remaining claims)
+Update flags:
+  --description D --category C --style S --type T
+  --tags a,b --tags-mode merge|replace --remove-tags x,y
+  --duplicates (also edit every copy in each asset's duplicate cluster)
+  --reviewed / --unreviewed (force the review flag)
 
 Examples:
   modon setup --previews ~/Assets/Models
@@ -298,17 +317,19 @@ func cmdSearch(args []string) error {
 	image := fs.String("image", "", "")
 	styleRef := fs.String("style-ref", "", "")
 	styleWeight := fs.Float64("style-weight", 0, "")
+	expand := fs.Bool("expand", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	q := model.Query{
-		Text:        strings.Join(fs.Args(), " "),
-		Image:       *image,
-		StyleWeight: *styleWeight,
-		Category:    *category,
-		Style:       *style,
-		AssetType:   *atype,
-		Limit:       *limit,
+		ExpandDuplicates: *expand,
+		Text:             strings.Join(fs.Args(), " "),
+		Image:            *image,
+		StyleWeight:      *styleWeight,
+		Category:         *category,
+		Style:            *style,
+		AssetType:        *atype,
+		Limit:            *limit,
 	}
 	if *animated {
 		t := true
@@ -377,7 +398,11 @@ func cmdSearch(args []string) error {
 		if len(a.MatchedBy) > 0 {
 			match = fmt.Sprintf(" | %.3f %s", a.Score, strings.Join(a.MatchedBy, "+"))
 		}
-		fmt.Printf("- %s | %s | %s | %s%s%s%s\n", a.ID, a.Title, price, a.Source, anim, flag, match)
+		dups := ""
+		if len(a.Duplicates) > 0 {
+			dups = fmt.Sprintf(" (+%d copies)", len(a.Duplicates))
+		}
+		fmt.Printf("- %s | %s%s | %s | %s%s%s%s\n", a.ID, a.Title, dups, price, a.Source, anim, flag, match)
 		if a.Description != "" {
 			desc := a.Description
 			if len(desc) > 160 {

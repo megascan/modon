@@ -36,14 +36,36 @@ func NewLocal(st *store.Store, cfg *config.Config) *Local {
 func (l *Local) Name() string    { return model.SourceLocal }
 func (l *Local) Available() bool { return true }
 
+// collapsePool is how many candidates per wanted result are ranked before
+// duplicate clusters are collapsed, so collapsing still fills the page.
+const collapsePool = 3
+
+// Search ranks the local index. Unless q.ExpandDuplicates is set, copies of
+// one model (FBX + OBJ exports, a prop shared between packs) collapse into
+// the best-ranked one, whose Duplicates lists the others.
 func (l *Local) Search(ctx context.Context, q model.Query) ([]model.Asset, error) {
-	if l.Searcher != nil {
-		return l.Searcher.Search(ctx, q)
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 12
 	}
-	if (q.Image != "" && q.Text == "") || q.StyleRef != "" {
+	wq := q
+	if !q.ExpandDuplicates {
+		wq.Limit = limit * collapsePool
+	}
+	var res []model.Asset
+	var err error
+	switch {
+	case l.Searcher != nil:
+		res, err = l.Searcher.Search(ctx, wq)
+	case (q.Image != "" && q.Text == "") || q.StyleRef != "":
 		return nil, fmt.Errorf("image and style search need semantic search: set embedding.endpoint (see modon help)")
+	default:
+		res, err = l.Store.Search(wq)
 	}
-	return l.Store.Search(q)
+	if err != nil || q.ExpandDuplicates {
+		return res, err
+	}
+	return l.Store.CollapseDuplicates(res, limit)
 }
 
 func (l *Local) Details(ctx context.Context, id string) (*model.Asset, error) {
@@ -54,6 +76,15 @@ func (l *Local) Details(ctx context.Context, id string) (*model.Asset, error) {
 	a, err := l.Store.GetByID(rowID)
 	if err != nil {
 		return nil, err
+	}
+	members, err := l.Store.ClusterMembers(a.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range members {
+		if m != a.RowID {
+			a.Duplicates = append(a.Duplicates, fmt.Sprintf("local:%d", m))
+		}
 	}
 	return &a, nil
 }

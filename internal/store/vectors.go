@@ -268,16 +268,6 @@ func (s *Store) PreviewFailed() (map[int64]bool, error) {
 	return out, rows.Err()
 }
 
-// SetClassification fills category/style where the agent or importer left
-// them empty; existing values are kept.
-func (s *Store) SetClassification(id int64, category, style string) error {
-	_, err := s.db.Exec(`UPDATE assets SET
-		category = CASE WHEN category = '' THEN ? ELSE category END,
-		style = CASE WHEN style = '' THEN ? ELSE style END,
-		updated_at = ? WHERE id = ?`, category, style, now(), id)
-	return err
-}
-
 func encodeVec(v []float32) []byte {
 	b := make([]byte, 4*len(v))
 	for i, x := range v {

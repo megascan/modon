@@ -9,13 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"modon/internal/embed"
 	importdir "modon/internal/importer"
 	"modon/internal/model"
+	"modon/internal/naming"
 	"modon/internal/store"
 )
 
@@ -31,7 +31,7 @@ import (
 // the best signal and are always included; folders are added only when the
 // file name says nothing.
 func DocText(a model.Asset) (title, body string) {
-	name := CleanName(a.Title)
+	name := naming.CleanName(a.Title)
 	parts := []string{name}
 	if d := strings.TrimSpace(a.Description); d != "" {
 		parts = append(parts, d)
@@ -45,44 +45,6 @@ func DocText(a model.Asset) (title, body string) {
 		}
 	}
 	return "", strings.Join(parts, "; ")
-}
-
-// Leading pack/asset-kind codes used by Synty and similar libraries
-// (SM_ static mesh, SK_ skinned, SF_ Simple Fantasy, ...) and the type
-// abbreviations that follow them.
-var (
-	namePrefixes = map[string]bool{"sm": true, "sk": true, "sf": true, "si": true, "sr": true, "ai": true,
-		"fx": true, "pf": true, "bp": true, "sh": true, "sp": true, "se": true}
-	nameCodes = map[string]string{"veh": "vehicle", "bld": "building", "wep": "weapon", "env": "environment",
-		"chr": "character", "fx": "effect", "gen": "", "sh": ""}
-	camelBoundary = regexp.MustCompile(`([a-z])([A-Z])`)
-)
-
-// CleanName turns a file-derived title like "SF Veh BatteringRam 01" into
-// "vehicle Battering Ram": drops pack prefixes and variant numbers, expands
-// type codes and splits CamelCase.
-func CleanName(title string) string {
-	var out []string
-	for i, t := range strings.Fields(title) {
-		tl := strings.ToLower(t)
-		if i == 0 && namePrefixes[tl] {
-			continue
-		}
-		if _, err := strconv.Atoi(t); err == nil {
-			continue
-		}
-		if exp, ok := nameCodes[tl]; ok {
-			if exp != "" {
-				out = append(out, exp)
-			}
-			continue
-		}
-		out = append(out, camelBoundary.ReplaceAllString(t, "$1 $2"))
-	}
-	if len(out) == 0 {
-		return strings.TrimSpace(title)
-	}
-	return strings.Join(out, " ")
 }
 
 var genericNames = map[string]bool{"mesh": true, "model": true, "object": true, "untitled": true,
@@ -184,7 +146,8 @@ var ErrBusy = errors.New("another modon process is embedding this index; try aga
 
 // Backfill embeds every asset whose text document or preview changed since
 // it was last embedded. It is resumable: vectors are written per batch.
-// Full runs (no IDs) are exclusive across processes sharing the index.
+// Full runs (no IDs) are exclusive across processes sharing the index and
+// end by refreshing the duplicate clusters.
 func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStats, error) {
 	if !e.available(ctx) {
 		return nil, fmt.Errorf("embedding server unavailable: %s", e.statusHint())
@@ -246,6 +209,11 @@ func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStat
 		}
 	}
 
+	if len(o.IDs) == 0 && ctx.Err() == nil {
+		if _, err := e.Dedupe(); err != nil {
+			stats.Errors = append(stats.Errors, "dedupe: "+err.Error())
+		}
+	}
 	counts := e.st.VectorCounts()
 	stats.TextTotal, stats.ImagesTotal = counts[store.VecText], counts[store.VecImage]
 	return stats, ctx.Err()

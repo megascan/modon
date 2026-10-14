@@ -107,7 +107,7 @@ func TestRefreshIsTargeted(t *testing.T) {
 	}
 	before := *f.calls
 	id := f.ids["rock big"]
-	if _, err := f.st.UpdateMetadata(id, "a granite boulder", "rock", "", "", nil); err != nil {
+	if _, err := f.st.UpdateMetadata(id, store.MetadataUpdate{Description: "a granite boulder"}); err != nil {
 		t.Fatal(err)
 	}
 	f.eng.Refresh(ctx, id)

@@ -17,10 +17,11 @@ import (
 )
 
 type Store struct {
-	db   *sql.DB
-	path string
-	fts  bool
-	vc   vecCache
+	db      *sql.DB
+	path    string
+	fts     bool
+	vc      vecCache
+	version int // PRAGMA user_version found at open
 }
 
 func Open(path string) (*Store, error) {
@@ -79,11 +80,14 @@ func (s *Store) migrate() error {
 	if err := s.migrateVectors(); err != nil {
 		return fmt.Errorf("migrate vectors: %w", err)
 	}
+	if err := s.migrateSchema(); err != nil {
+		return fmt.Errorf("migrate schema: %w", err)
+	}
 	fts := `CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
 		title, name, description, category, style, tags, creator,
 		content='assets', content_rowid='id', tokenize='porter unicode61')`
 	if _, err := s.db.Exec(fts); err != nil {
-		return nil // FTS5 unavailable; LIKE fallback covers search
+		return s.setVersion() // FTS5 unavailable; LIKE fallback covers search
 	}
 	triggers := []string{
 		`CREATE TRIGGER IF NOT EXISTS assets_fts_ai AFTER INSERT ON assets BEGIN
@@ -94,7 +98,9 @@ func (s *Store) migrate() error {
 			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator)
 			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator);
 		END`,
-		`CREATE TRIGGER IF NOT EXISTS assets_fts_au AFTER UPDATE ON assets BEGIN
+		// Only the indexed text columns: preview, cluster and review
+		// updates must not rewrite the FTS row.
+		`CREATE TRIGGER IF NOT EXISTS assets_fts_au AFTER UPDATE OF title,name,description,category,style,tags,creator ON assets BEGIN
 			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator)
 			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator);
 			INSERT INTO assets_fts(rowid,title,name,description,category,style,tags,creator)
@@ -103,11 +109,11 @@ func (s *Store) migrate() error {
 	}
 	for _, t := range triggers {
 		if _, err := s.db.Exec(t); err != nil {
-			return nil
+			return s.setVersion()
 		}
 	}
 	s.fts = true
-	return nil
+	return s.setVersion()
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -150,7 +156,10 @@ func mergeUnique(a, b []string) []string {
 }
 
 // Upsert inserts or updates the local asset identified by its path and
-// returns the row id. Agent-written metadata is preserved across re-imports.
+// returns the row id. On re-import, fields an agent wrote (provenance
+// "agent") are kept verbatim, including its tag list; heuristic values are
+// refreshed from the new import; zero-shot ("auto") values are kept only
+// while the heuristic still has nothing for that field.
 func (s *Store) Upsert(a model.Asset) (int64, error) {
 	if a.PrimaryFile == "" {
 		return 0, errors.New("asset has no primary file")
@@ -161,42 +170,58 @@ func (s *Store) Upsert(a model.Asset) (int64, error) {
 	}
 	a.PrimaryFile = abs
 
-	var prevDesc, prevCat, prevStyle, prevType, prevTags string
-	var prevNeeds int
-	err = s.db.QueryRow(`SELECT description, category, style, asset_type, tags, needs_review
+	var prev struct {
+		desc, cat, style, typ, tags                 string
+		descSrc, catSrc, styleSrc, typeSrc, tagsSrc string
+		needs                                       int
+	}
+	err = s.db.QueryRow(`SELECT description, category, style, asset_type, tags, needs_review,
+		desc_src, category_src, style_src, type_src, tags_src
 		FROM assets WHERE path=?`, a.PrimaryFile).
-		Scan(&prevDesc, &prevCat, &prevStyle, &prevType, &prevTags, &prevNeeds)
+		Scan(&prev.desc, &prev.cat, &prev.style, &prev.typ, &prev.tags, &prev.needs,
+			&prev.descSrc, &prev.catSrc, &prev.styleSrc, &prev.typeSrc, &prev.tagsSrc)
 	existed := true
 	if errors.Is(err, sql.ErrNoRows) {
 		existed = false
 	} else if err != nil {
 		return 0, err
 	}
-	if prevDesc != "" {
-		a.Description = prevDesc
+	src := map[string]string{}
+	// A heuristic or zero-shot value is kept only when the new import has
+	// nothing for the field (indexes from before provenance tracking may hold
+	// zero-shot categories recorded as heuristic).
+	keep := func(field, prevSrc, prevVal string, cur *string) {
+		if prevSrc == model.ProvenanceAgent || (*cur == "" && prevVal != "") {
+			*cur = prevVal
+			src[field] = prevSrc
+		}
 	}
-	if prevCat != "" {
-		a.Category = prevCat
+	if existed {
+		// Importers never write descriptions; whatever is there was written
+		// by an agent or by hand.
+		if prev.desc != "" {
+			a.Description = prev.desc
+			src["description"] = orDefault(prev.descSrc, model.ProvenanceAgent)
+		}
+		keep("category", prev.catSrc, prev.cat, &a.Category)
+		keep("style", prev.styleSrc, prev.style, &a.Style)
+		keep("asset_type", prev.typeSrc, prev.typ, &a.AssetType)
+		if prev.tagsSrc == model.ProvenanceAgent {
+			a.Tags = strings.Fields(prev.tags)
+			src["tags"] = model.ProvenanceAgent
+		}
 	}
-	if prevStyle != "" {
-		a.Style = prevStyle
-	}
-	if prevType != "" && prevType != "model" {
-		a.AssetType = prevType
-	}
-	if prevTags != "" {
-		a.Tags = mergeUnique(strings.Fields(prevTags), a.Tags)
-	}
-	needs := boolInt(a.Description == "")
-	if existed && prevNeeds == 0 {
+	needs := boolInt(!reviewed(a.Description, a.Category, a.Tags, src))
+	if existed && prev.needs == 0 {
 		needs = 0
 	}
 
 	res, err := s.db.Exec(`INSERT INTO assets
 		(path,title,name,description,asset_type,category,style,tags,animated,animation_names,
 		 tri_count,vert_count,formats,related_files,file_size,texture_count,material_names,
-		 license,creator,preview_path,preview_status,needs_review,imported_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 license,creator,preview_path,preview_status,needs_review,imported_at,updated_at,
+		 desc_src,category_src,style_src,type_src,tags_src)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(path) DO UPDATE SET
 			title=excluded.title, name=excluded.name,
 			description=excluded.description, asset_type=excluded.asset_type,
@@ -207,16 +232,19 @@ func (s *Store) Upsert(a model.Asset) (int64, error) {
 			file_size=excluded.file_size, texture_count=excluded.texture_count,
 			material_names=excluded.material_names, license=excluded.license,
 			creator=excluded.creator, needs_review=excluded.needs_review,
+			desc_src=excluded.desc_src, category_src=excluded.category_src,
+			style_src=excluded.style_src, type_src=excluded.type_src, tags_src=excluded.tags_src,
 			updated_at=excluded.updated_at`,
 		a.PrimaryFile, a.Title, a.Name, a.Description, a.AssetType, a.Category, a.Style,
-		strings.Join(a.Tags, " "), boolInt(a.Animated), joinComma(a.AnimationNames),
+		joinTags(a.Tags), boolInt(a.Animated), joinComma(a.AnimationNames),
 		a.TriCount, a.VertCount, joinComma(a.Formats), joinComma(a.Files), a.FileSize,
 		a.TextureCount, joinComma(a.MaterialNames), a.License, a.Creator,
-		a.PreviewPath, previewStatus(a), needs, now(), now())
+		a.PreviewPath, previewStatus(a), needs, now(), now(),
+		src["description"], src["category"], src["style"], src["asset_type"], src["tags"])
 	if err != nil {
 		return 0, err
 	}
-	if id, err := res.LastInsertId(); err == nil && id > 0 {
+	if id, err := res.LastInsertId(); err == nil && id > 0 && !existed {
 		return id, nil
 	}
 	var id int64
@@ -234,13 +262,13 @@ func previewStatus(a model.Asset) string {
 const selectCols = `id,path,title,name,description,asset_type,category,style,tags,
 	animated,animation_names,tri_count,vert_count,formats,related_files,file_size,
 	texture_count,material_names,license,creator,preview_path,preview_status,needs_review,
-	imported_at,updated_at`
+	imported_at,updated_at,desc_src,category_src,style_src,type_src,tags_src,cluster_id`
 
 // selectColsAlias qualifies every column for joined queries (FTS + assets).
 const selectColsAlias = `a.id,a.path,a.title,a.name,a.description,a.asset_type,a.category,a.style,a.tags,
 	a.animated,a.animation_names,a.tri_count,a.vert_count,a.formats,a.related_files,a.file_size,
 	a.texture_count,a.material_names,a.license,a.creator,a.preview_path,a.preview_status,a.needs_review,
-	a.imported_at,a.updated_at`
+	a.imported_at,a.updated_at,a.desc_src,a.category_src,a.style_src,a.type_src,a.tags_src,a.cluster_id`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -251,11 +279,12 @@ func scanAsset(sc scanner, withScore bool) (model.Asset, float64, error) {
 	var animated, needs int
 	var animNames, formats, related, materials string
 	var license, creator, previewPath, previewStatus, importedAt, updatedAt string
+	var srcs [len(provenanceFields)]string
 
 	dest := []any{&a.RowID, &path, &a.Title, &name, &desc, &atype, &category, &style, &tags,
 		&animated, &animNames, &a.TriCount, &a.VertCount, &formats, &related, &a.FileSize,
 		&a.TextureCount, &materials, &license, &creator, &previewPath, &previewStatus, &needs,
-		&importedAt, &updatedAt}
+		&importedAt, &updatedAt, &srcs[0], &srcs[1], &srcs[2], &srcs[3], &srcs[4], &a.ClusterID}
 	if withScore {
 		dest = append(dest, &score)
 	}
@@ -282,6 +311,14 @@ func scanAsset(sc scanner, withScore bool) (model.Asset, float64, error) {
 	a.IsFree = true
 	a.Owned = true
 	a.NeedsReview = needs == 1
+	for i, f := range provenanceFields {
+		if srcs[i] != "" {
+			if a.Provenance == nil {
+				a.Provenance = map[string]string{}
+			}
+			a.Provenance[f] = srcs[i]
+		}
+	}
 	a.ID = fmt.Sprintf("local:%d", a.RowID)
 	return a, score, nil
 }
@@ -479,56 +516,6 @@ func collect(rows *sql.Rows) []model.Asset {
 	return out
 }
 
-// UpdateMetadata stores agent-written enrichment and clears needs_review
-// once a description exists. Empty arguments leave the field unchanged.
-func (s *Store) UpdateMetadata(id int64, description, category, style, assetType string, tags []string) (model.Asset, error) {
-	a, err := s.GetByID(id)
-	if err != nil {
-		return a, err
-	}
-	if description != "" {
-		a.Description = description
-	}
-	if category != "" {
-		a.Category = category
-	}
-	if style != "" {
-		a.Style = style
-	}
-	if assetType != "" {
-		a.AssetType = assetType
-	}
-	if len(tags) > 0 {
-		a.Tags = mergeUnique(a.Tags, tags)
-	}
-	a.NeedsReview = a.Description == ""
-	_, err = s.db.Exec(`UPDATE assets SET description=?, category=?, style=?, asset_type=?, tags=?, needs_review=?, updated_at=? WHERE id=?`,
-		a.Description, a.Category, a.Style, a.AssetType, strings.Join(a.Tags, " "), boolInt(a.NeedsReview), now(), id)
-	if err != nil {
-		return a, err
-	}
-	return s.GetByID(id)
-}
-
-func (s *Store) ListUnclassified(limit int) ([]model.Asset, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := s.db.Query(`SELECT `+selectCols+` FROM assets WHERE needs_review=1 ORDER BY file_size DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	var out []model.Asset
-	for rows.Next() {
-		a, _, err := scanAsset(rows, false)
-		if err == nil {
-			out = append(out, a)
-		}
-	}
-	rows.Close()
-	return out, nil
-}
-
 func (s *Store) SetPreview(id int64, path, status string) error {
 	_, err := s.db.Exec(`UPDATE assets SET preview_path=?, preview_status=?, updated_at=? WHERE id=?`,
 		path, status, now(), id)
@@ -571,6 +558,15 @@ func (s *Store) Stats() (map[string]any, error) {
 	var animated int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE animated=1`).Scan(&animated)
 	out["animated"] = animated
+	clusters, copies := s.ClusterStats()
+	out["duplicate_clusters"] = clusters
+	out["redundant_copies"] = copies
+	if claims := s.ActiveClaims(); len(claims) > 0 {
+		out["claims_by_worker"] = claims
+	}
+	var agent int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE desc_src='agent' OR category_src='agent' OR tags_src='agent'`).Scan(&agent)
+	out["agent_edited"] = agent
 	return out, nil
 }
 

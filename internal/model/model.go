@@ -39,7 +39,20 @@ type Asset struct {
 	FileSize      int64    `json:"file_size,omitempty"`
 	TextureCount  int      `json:"texture_count,omitempty"`
 	MaterialNames []string `json:"material_names,omitempty"`
-	NeedsReview   bool     `json:"needs_review"` // true until a rich description exists
+	NeedsReview   bool     `json:"needs_review"` // true until a description (or category + tags) is written
+
+	// Provenance names the writer of each metadata field that did not come
+	// from the importer's heuristics: "agent" (update_asset_metadata) or
+	// "auto" (zero-shot classification). Keys: description, category,
+	// style, asset_type, tags. Agent values survive re-imports.
+	Provenance map[string]string `json:"provenance,omitempty"`
+
+	// ClusterID groups copies of one model (same name exported as FBX and
+	// OBJ, or shared between packs with a near-identical preview). 0 means
+	// the asset has no known duplicates. Duplicates lists the other members
+	// when search collapses a cluster into this result.
+	ClusterID  int64    `json:"cluster_id,omitempty"`
+	Duplicates []string `json:"duplicates,omitempty"`
 
 	// Remote-source specific.
 	PreviewURL  string `json:"preview_url,omitempty"`
@@ -85,7 +98,16 @@ type Query struct {
 	MinPrice    float64
 	MaxPrice    float64 // 0 = no limit
 	Limit       int
+	// ExpandDuplicates returns every copy of a model instead of collapsing
+	// each duplicate cluster into its best-ranked member (local index).
+	ExpandDuplicates bool
 }
+
+// Metadata sources recorded in Asset.Provenance.
+const (
+	ProvenanceAgent = "agent"
+	ProvenanceAuto  = "auto"
+)
 
 // DownloadResult describes the outcome of a download call. Status is one of
 // "downloaded", "reference", "purchase_required", "claim_required",
