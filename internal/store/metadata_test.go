@@ -295,7 +295,7 @@ func TestMigrateFromV1(t *testing.T) {
 	if st.version != schemaVersion {
 		t.Fatalf("user_version = %d", st.version)
 	}
-	res, err := st.Search(model.Query{Text: "fishcrate"})
+	res, err := st.Search(model.Query{Text: "fish crate dock"})
 	if err != nil || len(res) != 1 {
 		t.Fatalf("migrated FTS: %v %v", res, err)
 	}

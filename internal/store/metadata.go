@@ -17,7 +17,8 @@ import (
 //	2: per-field provenance (desc_src, category_src, style_src, type_src,
 //	   tags_src), cluster_id, the claims table; the FTS update trigger
 //	   fires only for indexed columns
-const schemaVersion = 2
+//	3: name_words (split file names) and pack in the full-text index
+const schemaVersion = 3
 
 // provenanceFields are the Asset.Provenance keys, in column order
 // (desc_src, category_src, style_src, type_src, tags_src).
@@ -50,6 +51,8 @@ func (s *Store) migrateSchema() error {
 		{"type_src", "TEXT DEFAULT ''"},
 		{"tags_src", "TEXT DEFAULT ''"},
 		{"cluster_id", "INTEGER DEFAULT 0"},
+		{"name_words", "TEXT DEFAULT ''"},
+		{"pack", "TEXT DEFAULT ''"},
 	} {
 		if have[c.name] {
 			continue
@@ -80,6 +83,19 @@ func (s *Store) migrateSchema() error {
 		}
 		if _, err := s.db.Exec(`DROP TRIGGER IF EXISTS assets_fts_au`); err != nil {
 			return err
+		}
+	}
+	if s.version < 3 {
+		if err := s.fillNameWords(); err != nil {
+			return err
+		}
+		// The full-text table gains columns: recreate it (migrate rebuilds
+		// its content once the new triggers exist).
+		for _, q := range []string{`DROP TRIGGER IF EXISTS assets_fts_ai`, `DROP TRIGGER IF EXISTS assets_fts_ad`,
+			`DROP TRIGGER IF EXISTS assets_fts_au`, `DROP TABLE IF EXISTS assets_fts`} {
+			if _, err := s.db.Exec(q); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

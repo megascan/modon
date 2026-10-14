@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"modon/internal/model"
+	"modon/internal/naming"
 
 	_ "modernc.org/sqlite"
 )
@@ -22,6 +23,7 @@ type Store struct {
 	fts     bool
 	vc      vecCache
 	version int // PRAGMA user_version found at open
+	df      dfCache
 }
 
 func Open(path string) (*Store, error) {
@@ -84,27 +86,27 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
 	fts := `CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
-		title, name, description, category, style, tags, creator,
+		title, name, description, category, style, tags, creator, name_words, pack,
 		content='assets', content_rowid='id', tokenize='porter unicode61')`
 	if _, err := s.db.Exec(fts); err != nil {
 		return s.setVersion() // FTS5 unavailable; LIKE fallback covers search
 	}
 	triggers := []string{
 		`CREATE TRIGGER IF NOT EXISTS assets_fts_ai AFTER INSERT ON assets BEGIN
-			INSERT INTO assets_fts(rowid,title,name,description,category,style,tags,creator)
-			VALUES (new.id,new.title,new.name,new.description,new.category,new.style,new.tags,new.creator);
+			INSERT INTO assets_fts(rowid,title,name,description,category,style,tags,creator,name_words,pack)
+			VALUES (new.id,new.title,new.name,new.description,new.category,new.style,new.tags,new.creator,new.name_words,new.pack);
 		END`,
 		`CREATE TRIGGER IF NOT EXISTS assets_fts_ad AFTER DELETE ON assets BEGIN
-			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator)
-			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator);
+			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator,name_words,pack)
+			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator,old.name_words,old.pack);
 		END`,
 		// Only the indexed text columns: preview, cluster and review
 		// updates must not rewrite the FTS row.
-		`CREATE TRIGGER IF NOT EXISTS assets_fts_au AFTER UPDATE OF title,name,description,category,style,tags,creator ON assets BEGIN
-			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator)
-			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator);
-			INSERT INTO assets_fts(rowid,title,name,description,category,style,tags,creator)
-			VALUES (new.id,new.title,new.name,new.description,new.category,new.style,new.tags,new.creator);
+		`CREATE TRIGGER IF NOT EXISTS assets_fts_au AFTER UPDATE OF title,name,description,category,style,tags,creator,name_words,pack ON assets BEGIN
+			INSERT INTO assets_fts(assets_fts,rowid,title,name,description,category,style,tags,creator,name_words,pack)
+			VALUES ('delete',old.id,old.title,old.name,old.description,old.category,old.style,old.tags,old.creator,old.name_words,old.pack);
+			INSERT INTO assets_fts(rowid,title,name,description,category,style,tags,creator,name_words,pack)
+			VALUES (new.id,new.title,new.name,new.description,new.category,new.style,new.tags,new.creator,new.name_words,new.pack);
 		END`,
 	}
 	for _, t := range triggers {
@@ -113,6 +115,12 @@ func (s *Store) migrate() error {
 		}
 	}
 	s.fts = true
+	if s.version < 3 {
+		// v3 added name_words and pack: re-index everything.
+		if _, err := s.db.Exec(`INSERT INTO assets_fts(assets_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("rebuild full-text index: %w", err)
+		}
+	}
 	return s.setVersion()
 }
 
@@ -220,8 +228,8 @@ func (s *Store) Upsert(a model.Asset) (int64, error) {
 		(path,title,name,description,asset_type,category,style,tags,animated,animation_names,
 		 tri_count,vert_count,formats,related_files,file_size,texture_count,material_names,
 		 license,creator,preview_path,preview_status,needs_review,imported_at,updated_at,
-		 desc_src,category_src,style_src,type_src,tags_src)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 desc_src,category_src,style_src,type_src,tags_src,name_words,pack)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(path) DO UPDATE SET
 			title=excluded.title, name=excluded.name,
 			description=excluded.description, asset_type=excluded.asset_type,
@@ -234,13 +242,15 @@ func (s *Store) Upsert(a model.Asset) (int64, error) {
 			creator=excluded.creator, needs_review=excluded.needs_review,
 			desc_src=excluded.desc_src, category_src=excluded.category_src,
 			style_src=excluded.style_src, type_src=excluded.type_src, tags_src=excluded.tags_src,
+			name_words=excluded.name_words, pack=excluded.pack,
 			updated_at=excluded.updated_at`,
 		a.PrimaryFile, a.Title, a.Name, a.Description, a.AssetType, a.Category, a.Style,
 		joinTags(a.Tags), boolInt(a.Animated), joinComma(a.AnimationNames),
 		a.TriCount, a.VertCount, joinComma(a.Formats), joinComma(a.Files), a.FileSize,
 		a.TextureCount, joinComma(a.MaterialNames), a.License, a.Creator,
 		a.PreviewPath, previewStatus(a), needs, now(), now(),
-		src["description"], src["category"], src["style"], src["asset_type"], src["tags"])
+		src["description"], src["category"], src["style"], src["asset_type"], src["tags"],
+		nameWords(a.Title), naming.PackName(a.PrimaryFile))
 	if err != nil {
 		return 0, err
 	}
@@ -416,7 +426,7 @@ func (s *Store) SearchMode(q model.Query) ([]model.Asset, string, error) {
 
 	if s.fts && len(tokens) > 0 {
 		for i, match := range ftsQueries(tokens) {
-			query := `SELECT ` + selectColsAlias + `, bm25(assets_fts, 12.0, 4.0, 3.0, 4.0, 3.0, 5.0, 2.0) AS score
+			query := `SELECT ` + selectColsAlias + `, ` + bm25Rank + ` AS score
 				FROM assets_fts JOIN assets a ON a.id = assets_fts.rowid
 				WHERE assets_fts MATCH ?` + andClause(aliasFilter) + ` ORDER BY score LIMIT ?`
 			rows, err := s.db.Query(query, append([]any{match}, append(wargs, limit)...)...)

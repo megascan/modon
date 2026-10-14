@@ -230,9 +230,10 @@ func hitIDs(h []hit) []int64 {
 	return out
 }
 
-// fuse merges ranked lists with reciprocal rank fusion and loads the top
-// assets, annotating score and matched_by.
-func (e *Engine) fuse(signals []signal, limit int) ([]model.Asset, error) {
+// fuse merges ranked lists with reciprocal rank fusion plus the lexical
+// bonus (see keywordSignal) and loads the top assets, annotating score and
+// matched_by.
+func (e *Engine) fuse(signals []signal, bonus map[int64]float64, limit int) ([]model.Asset, error) {
 	score := map[int64]float64{}
 	by := map[int64][]string{}
 	for _, s := range signals {
@@ -240,6 +241,9 @@ func (e *Engine) fuse(signals []signal, limit int) ([]model.Asset, error) {
 			score[id] += s.weight / (rrfK + float64(r+1))
 			by[id] = append(by[id], s.name)
 		}
+	}
+	for id, b := range bonus {
+		score[id] += b
 	}
 	ids := make([]int64, 0, len(score))
 	for id := range score {
@@ -264,6 +268,9 @@ func (e *Engine) fuse(signals []signal, limit int) ([]model.Asset, error) {
 		if len(s.ids) > 0 {
 			maxScore += s.weight / (rrfK + 1)
 		}
+	}
+	if len(bonus) > 0 {
+		maxScore += lexBoost
 	}
 	for i := range assets {
 		id := assets[i].RowID
@@ -403,24 +410,13 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 	}
 
 	var signals []signal
+	var coverage map[int64]float64
 	if q.Text != "" {
-		kq := q
-		kq.Limit = poolSize
-		kw, mode, err := e.st.SearchMode(kq)
+		kw, cov, err := e.keywordSignal(q)
 		if err != nil {
 			return nil, err
 		}
-		ids := make([]int64, len(kw))
-		for i, a := range kw {
-			ids[i] = a.RowID
-		}
-		// Loose keyword fallbacks (any token, substring) are mostly noise
-		// for multi-word queries; the vectors carry those.
-		w := 1.0
-		if mode != store.MatchAll {
-			w = 0.35
-		}
-		signals = append(signals, signal{"keyword", w, ids})
+		signals, coverage = append(signals, kw), cov
 	}
 
 	allowed, err := e.st.FilteredIDs(q)
@@ -458,11 +454,12 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 			signal{"image", 1.5, hitIDs(rank(imageM, iv, allowed, 0, 0, poolSize))},
 			signal{"text", 0.5, hitIDs(rank(textM, iv, allowed, 0, 0, poolSize))})
 	}
+	bonus := lexicalBonus(coverage, signals)
 	if sv == nil {
-		return e.fuse(signals, limit)
+		return e.fuse(signals, bonus, limit)
 	}
 	pool := max(3*limit, 30)
-	cands, err := e.fuse(signals, pool)
+	cands, err := e.fuse(signals, bonus, pool)
 	if err != nil {
 		return nil, err
 	}

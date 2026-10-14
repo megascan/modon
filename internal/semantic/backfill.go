@@ -26,10 +26,17 @@ import (
 // just the cleaned name (title "none") scored precision@20 0.78 against
 // 0.70 for a document that also listed category, style, tags, type,
 // materials and folders: that boilerplate is shared by thousands of assets
-// and drowns out what the object is. Style, pack and tags stay reachable
-// through keyword search and facet filters. Agent-written descriptions are
-// the best signal and are always included; folders are added only when the
-// file name says nothing.
+// and drowns out what the object is. A re-run with only heuristic category,
+// filtered heuristic tags and the pack name confirmed it (precision@10 on
+// descriptive queries 0.69 -> 0.63, on synonym queries 0.65 -> 0.50; the
+// pack name alone 0.63 / 0.60).
+//
+// Agent-written metadata is the exception and is always embedded: the
+// description, and the category and tags once an agent wrote them
+// (provenance "agent"), so tagging improves semantic search. Heuristic
+// category, style, tags and the pack name stay reachable through keyword
+// search (they are in the full-text index) and facet filters. Folders are
+// added only when the file name says nothing.
 func DocText(a model.Asset) (title, body string) {
 	name := naming.CleanName(a.Title)
 	parts := []string{name}
@@ -44,8 +51,35 @@ func DocText(a model.Asset) (title, body string) {
 			parts = append(parts, f)
 		}
 	}
+	seen := map[string]bool{}
+	for _, w := range strings.Fields(strings.ToLower(name)) {
+		seen[w] = true
+	}
+	var extra []string
+	add := func(ws ...string) {
+		for _, w := range ws {
+			w = strings.ReplaceAll(w, "-", " ")
+			if lw := strings.ToLower(w); lw != "" && !seen[lw] && !boilerTags[lw] {
+				seen[lw] = true
+				extra = append(extra, w)
+			}
+		}
+	}
+	if a.Provenance["category"] == model.ProvenanceAgent {
+		add(a.Category)
+	}
+	if a.Provenance["tags"] == model.ProvenanceAgent {
+		add(a.Tags...)
+	}
+	if len(extra) > 0 {
+		parts = append(parts, strings.Join(extra, ", "))
+	}
 	return "", strings.Join(parts, "; ")
 }
+
+// boilerTags are importer tags that describe the file, not the object.
+var boilerTags = map[string]bool{"fbx": true, "obj": true, "glb": true, "gltf": true, "blend": true, "stl": true,
+	"ply": true, "dae": true, "textured": true, "untextured": true, "static": true, "mesh": true, "model": true}
 
 var genericNames = map[string]bool{"mesh": true, "model": true, "object": true, "untitled": true,
 	"scene": true, "export": true, "default": true, "asset": true, "new": true, "final": true}
