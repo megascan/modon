@@ -55,11 +55,29 @@ type EmbeddingConfig struct {
 	Endpoint       string `json:"endpoint,omitempty"`        // e.g. http://127.0.0.1:8178
 	Model          string `json:"model,omitempty"`           // default google/embeddinggemma-2
 	Dims           int    `json:"dims,omitempty"`            // Matryoshka size: 768, 512, 256 (default), 128
-	Autostart      bool   `json:"autostart,omitempty"`       // launch the sidecar via uv when nothing answers
+	Autostart      bool   `json:"autostart,omitempty"`       // start the shared server (systemd unit or detached embed-server) when nothing answers
 	ImageTokens    int    `json:"image_tokens,omitempty"`    // vision tokens per image, 70-1120 (default 280)
 	Device         string `json:"device,omitempty"`          // sidecar device: cuda | cpu | mps (default auto)
 	UVPath         string `json:"uv_path,omitempty"`         // default: uv in PATH
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // per request, default 300
+	// IdleOffloadSeconds moves the model off the GPU after this long without
+	// requests, freeing VRAM for games and editors; it returns on the next
+	// request. 0 = default (600), negative = keep it on the GPU.
+	IdleOffloadSeconds int `json:"idle_offload_seconds,omitempty"`
+}
+
+// DefaultIdleOffload is the idle time before the model leaves the GPU.
+const DefaultIdleOffload = 600
+
+// IdleOffload resolves IdleOffloadSeconds (0 = never).
+func (e EmbeddingConfig) IdleOffload() int {
+	switch {
+	case e.IdleOffloadSeconds < 0:
+		return 0
+	case e.IdleOffloadSeconds == 0:
+		return DefaultIdleOffload
+	}
+	return e.IdleOffloadSeconds
 }
 
 // Defaults returns the configuration with all optional fields populated.

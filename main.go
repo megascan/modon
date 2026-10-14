@@ -16,12 +16,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -63,6 +66,8 @@ func main() {
 		err = cmdEmbed(args)
 	case "embed-server":
 		err = cmdEmbedServer(args)
+	case "service":
+		err = cmdService(args)
 	case "similar":
 		err = cmdSimilar(args)
 	case "suggest":
@@ -100,7 +105,9 @@ Usage:
   modon preview [flags] <id>    Fetch/render a preview image
   modon download [flags] <id>   Download (or reference) an asset
   modon embed [flags]           Build/refresh semantic vectors (text + preview images)
-  modon embed-server [flags]    Run the EmbeddingGemma 2 sidecar (needs uv)
+  modon embed-server [flags]    Run the shared EmbeddingGemma 2 server (needs uv)
+  modon service install|uninstall|status|print
+                                Keep the embedding server up as a systemd user unit
   modon similar [flags] <id>    Owned assets that look like <id> (local or remote)
   modon suggest <id>            Zero-shot category/style guesses for a local asset
   modon config [get|set|path]   Inspect or change configuration
@@ -137,6 +144,11 @@ Embed flags:
   --eval (zero-shot accuracy vs. importer categories)
 Embed-server flags:
   --port N --device cuda|cpu|mps --image-tokens N --text-only
+  --idle-offload SECONDS (leave the GPU when idle; default embedding.idle_offload_seconds)
+  --detach (start in the background and return)
+  One server per machine: a second embed-server exits when one is running.
+  Clients with embedding.autostart reuse it, or start the systemd unit
+  (modon service install) / a detached server when it is missing.
 
 Examples:
   modon setup --previews ~/Assets/Models
@@ -567,6 +579,8 @@ func configValue(cfg *config.Config, key string) string {
 		return cfg.Embedding.UVPath
 	case "embedding.timeout_seconds":
 		return strconv.Itoa(cfg.Embedding.TimeoutSeconds)
+	case "embedding.idle_offload_seconds":
+		return strconv.Itoa(cfg.Embedding.IdleOffloadSeconds)
 	default:
 		return "unknown key (see modon config with no args)"
 	}
@@ -659,6 +673,12 @@ func setConfigValue(cfg *config.Config, key, val string) error {
 			return err
 		}
 		cfg.Embedding.TimeoutSeconds = n
+	case "embedding.idle_offload_seconds":
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return err
+		}
+		cfg.Embedding.IdleOffloadSeconds = n
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}
@@ -681,18 +701,18 @@ func cmdStats(_ []string) error {
 
 // ---- semantic ----
 
-// startSidecar launches the embedding sidecar for CLI commands when
-// embedding.autostart is set, waiting up to wait for it to load.
+// startSidecar makes sure the shared embedding server runs for CLI
+// commands when embedding.autostart is set, waiting up to wait for it.
 func startSidecar(d *server.Deps, wait time.Duration) {
 	if !d.Sem.Enabled() || !d.Cfg.Embedding.Autostart || d.Sem.Reachable(context.Background()) {
 		return
 	}
 	if wait == 0 {
-		wait = 3 * time.Minute
+		wait = 90 * time.Second
 	}
-	fmt.Fprintln(os.Stderr, "starting embedding sidecar (first run installs torch + downloads the model)...")
+	fmt.Fprintln(os.Stderr, "starting the embedding server (the first run installs torch and downloads the model)...")
 	if err := d.Sem.Start(context.Background(), wait); err != nil {
-		fmt.Fprintln(os.Stderr, "embedding sidecar:", err)
+		fmt.Fprintln(os.Stderr, "embedding server:", err, "- using keyword search")
 	}
 }
 
@@ -765,6 +785,8 @@ func cmdEmbedServer(args []string) error {
 	device := fs.String("device", "", "cuda | cpu | mps (default auto)")
 	imageTokens := fs.Int("image-tokens", 0, "vision tokens per image (70-1120)")
 	textOnly := fs.Bool("text-only", false, "skip the vision encoder")
+	idle := fs.Int("idle-offload", -2, "seconds idle before leaving the GPU (0 = never)")
+	detach := fs.Bool("detach", false, "start in the background and return")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -776,6 +798,24 @@ func cmdEmbedServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *detach {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		var rest []string
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name != "detach" {
+				rest = append(rest, "--"+f.Name+"="+f.Value.String())
+			}
+		})
+		logPath := filepath.Join(cache, "embed_server.log")
+		if err := embed.SpawnDetached(exe, append([]string{"embed-server"}, rest...), logPath); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "embedding server starting in the background; log:", logPath)
+		return nil
+	}
 	endpoint := cfg.Embedding.Endpoint
 	if endpoint == "" {
 		endpoint = "http://127.0.0.1:8178"
@@ -786,6 +826,7 @@ func cmdEmbedServer(args []string) error {
 	o := embed.SidecarOptions{
 		UV: cfg.Embedding.UVPath, CacheDir: cache, Endpoint: endpoint,
 		ImageTokens: cfg.Embedding.ImageTokens, Device: cfg.Embedding.Device, TextOnly: *textOnly,
+		IdleOffload: cfg.Embedding.IdleOffload(),
 	}
 	if *device != "" {
 		o.Device = *device
@@ -793,15 +834,22 @@ func cmdEmbedServer(args []string) error {
 	if *imageTokens > 0 {
 		o.ImageTokens = *imageTokens
 	}
-	cmd, err := embed.Command(context.Background(), o)
-	if err != nil {
-		return err
+	if *idle >= 0 {
+		o.IdleOffload = *idle
 	}
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if cfg.Embedding.Endpoint == "" {
 		fmt.Fprintf(os.Stderr, "tip: modon config set embedding.endpoint %s\n", endpoint)
 	}
-	return cmd.Run()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	cl := embed.New(endpoint, cfg.Embedding.Model, cfg.Embedding.Dims, 5*time.Second)
+	err = embed.Serve(ctx, cl, embed.ServeOptions{Sidecar: o})
+	if errors.Is(err, embed.ErrServerRunning) {
+		// Not a failure: the machine already has its server.
+		fmt.Fprintln(os.Stderr, "modon embed-server:", err)
+		return nil
+	}
+	return err
 }
 
 func cmdSimilar(args []string) error {

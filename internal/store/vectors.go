@@ -101,6 +101,33 @@ func (s *Store) VectorHashes(kind, modelID string, dims int) (map[int64]string, 
 	return out, rows.Err()
 }
 
+// VectorHashesFor is VectorHashes restricted to the given assets, so a
+// single-asset refresh does not read every hash in the index.
+func (s *Store) VectorHashesFor(kind, modelID string, dims int, ids []int64) (map[int64]string, error) {
+	out := map[int64]string{}
+	for start := 0; start < len(ids); start += 500 {
+		chunk := ids[start:min(start+500, len(ids))]
+		args := []any{kind, modelID, dims}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.Query(`SELECT asset_id, hash FROM asset_vectors WHERE kind=? AND model=? AND dims=? AND asset_id IN (`+
+			strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var h string
+			if err := rows.Scan(&id, &h); err == nil {
+				out[id] = h
+			}
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
 // Vectors returns the cached matrix for a kind/model/dims, reloading it from
 // SQLite after any write — including writes by other modon processes (a
 // CLI `modon embed` while an MCP server is running), which SQLite's

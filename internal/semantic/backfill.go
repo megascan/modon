@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"modon/internal/embed"
 	importdir "modon/internal/importer"
@@ -212,13 +213,9 @@ func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStat
 	}
 
 	if o.Text {
-		have, err := e.st.VectorHashes(store.VecText, e.modelID(), e.dims())
+		have, err := e.hashes(store.VecText, o.IDs)
 		if err != nil {
 			return nil, err
-		}
-		type job struct {
-			id        int64
-			doc, hash string
 		}
 		var jobs []job
 		for _, a := range assets {
@@ -227,28 +224,15 @@ func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStat
 				stats.UpToDate++
 				continue
 			}
-			jobs = append(jobs, job{a.RowID, doc, h})
+			jobs = append(jobs, job{a.RowID, embed.Input{Text: doc}, h})
 		}
 		if o.Limit > 0 && len(jobs) > o.Limit {
 			jobs = jobs[:o.Limit]
 		}
-		for i := 0; i < len(jobs) && ctx.Err() == nil; i += textBatch {
-			batch := jobs[i:min(i+textBatch, len(jobs))]
-			ins := make([]embed.Input, len(batch))
-			for j, b := range batch {
-				ins[j] = embed.Input{Text: b.doc}
-			}
-			vecs, err := e.cl.Embed(ctx, ins)
-			if err != nil {
-				return stats, fmt.Errorf("embed text: %w", err)
-			}
-			for j, b := range batch {
-				if err := e.st.PutVector(b.id, store.VecText, e.modelID(), b.hash, vecs[j]); err != nil {
-					return stats, err
-				}
-				stats.Text++
-			}
-			progress("text", min(i+textBatch, len(jobs)), len(jobs))
+		n, err := e.runJobs(ctx, store.VecText, jobs, textBatch, stats, func(done int) { progress("text", done, len(jobs)) })
+		stats.Text += n
+		if err != nil {
+			return stats, fmt.Errorf("embed text: %w", err)
 		}
 	}
 
@@ -265,6 +249,122 @@ func (e *Engine) Backfill(ctx context.Context, o BackfillOptions) (*BackfillStat
 	counts := e.st.VectorCounts()
 	stats.TextTotal, stats.ImagesTotal = counts[store.VecText], counts[store.VecImage]
 	return stats, ctx.Err()
+}
+
+// hashes loads stored content hashes: only the given assets for a targeted
+// refresh (constant cost per edit), the whole index for a full run.
+func (e *Engine) hashes(kind string, ids []int64) (map[int64]string, error) {
+	if len(ids) > 0 {
+		return e.st.VectorHashesFor(kind, e.modelID(), e.dims(), ids)
+	}
+	return e.st.VectorHashes(kind, e.modelID(), e.dims())
+}
+
+type job struct {
+	id   int64
+	in   embed.Input
+	hash string
+}
+
+// runJobs embeds jobs in batches and stores the vectors. Failed inputs are
+// counted (first errors kept) without stopping the run; it only aborts
+// when the server stays unreachable.
+func (e *Engine) runJobs(ctx context.Context, kind string, jobs []job, batch int, stats *BackfillStats, progress func(done int)) (int, error) {
+	stored := 0
+	for i := 0; i < len(jobs) && ctx.Err() == nil; i += batch {
+		b := jobs[i:min(i+batch, len(jobs))]
+		ins := make([]embed.Input, len(b))
+		for j, x := range b {
+			ins[j] = x.in
+		}
+		vecs, errs, fatal := e.embedAll(ctx, ins)
+		for j, x := range b {
+			if errs[j] != nil {
+				stats.Failed++
+				if len(stats.Errors) < 10 {
+					stats.Errors = append(stats.Errors, fmt.Sprintf("local:%d: %v", x.id, errs[j]))
+				}
+				continue
+			}
+			if err := e.st.PutVector(x.id, kind, e.modelID(), x.hash, vecs[j]); err != nil {
+				return stored, err
+			}
+			stored++
+		}
+		if fatal != nil {
+			return stored, fatal
+		}
+		progress(min(i+batch, len(jobs)))
+	}
+	return stored, nil
+}
+
+// Retry policy for embedding requests (variables so tests can shorten it).
+var (
+	retryAttempts = 3
+	retryBackoff  = 2 * time.Second
+	restartWait   = 3 * time.Minute
+)
+
+// embedAll embeds a batch and survives server trouble instead of failing
+// items: transient errors (server restarting, GPU out of memory) are
+// retried with backoff, restarting a vanished server when autostart is on;
+// a batch that still fails is split in halves, so an oversized batch
+// shrinks until it fits and one bad input fails alone. fatal is set when
+// the server stays unreachable or ctx ends.
+func (e *Engine) embedAll(ctx context.Context, ins []embed.Input) (vecs [][]float32, errs []error, fatal error) {
+	vecs, errs = make([][]float32, len(ins)), make([]error, len(ins))
+	var rec func(lo, hi int)
+	rec = func(lo, hi int) {
+		if fatal != nil {
+			for i := lo; i < hi; i++ {
+				errs[i] = fatal
+			}
+			return
+		}
+		v, err := e.embedRetry(ctx, ins[lo:hi])
+		switch {
+		case err == nil:
+			copy(vecs[lo:hi], v)
+			return
+		case ctx.Err() != nil:
+			fatal = ctx.Err()
+		case embed.Unreachable(err):
+			fatal = err
+		}
+		if fatal != nil || hi-lo == 1 {
+			for i := lo; i < hi; i++ {
+				errs[i] = err
+			}
+			return
+		}
+		mid := (lo + hi) / 2
+		rec(lo, mid)
+		rec(mid, hi)
+	}
+	rec(0, len(ins))
+	return vecs, errs, fatal
+}
+
+func (e *Engine) embedRetry(ctx context.Context, ins []embed.Input) ([][]float32, error) {
+	backoff := retryBackoff
+	for attempt := 0; ; attempt++ {
+		v, err := e.cl.Embed(ctx, ins)
+		if err == nil || !embed.Transient(err) || attempt >= retryAttempts || ctx.Err() != nil {
+			return v, err
+		}
+		if embed.Unreachable(err) && e.cfg.Embedding.Autostart {
+			if serr := e.ensure(ctx, restartWait); serr == nil {
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
 }
 
 func (e *Engine) embedImages(ctx context.Context, assets []model.Asset, o BackfillOptions, stats *BackfillStats, progress func(string, int, int)) error {
@@ -298,13 +398,9 @@ func (e *Engine) embedImages(ctx context.Context, assets []model.Asset, o Backfi
 		}
 	}
 
-	have, err := e.st.VectorHashes(store.VecImage, e.modelID(), e.dims())
+	have, err := e.hashes(store.VecImage, o.IDs)
 	if err != nil {
 		return err
-	}
-	type job struct {
-		id         int64
-		path, hash string
 	}
 	var jobs []job
 	for _, a := range assets {
@@ -315,44 +411,16 @@ func (e *Engine) embedImages(ctx context.Context, assets []model.Asset, o Backfi
 		case have[a.RowID] == h:
 			stats.UpToDate++
 		default:
-			jobs = append(jobs, job{a.RowID, a.PreviewPath, h})
+			jobs = append(jobs, job{a.RowID, embed.Input{Image: a.PreviewPath}, h})
 		}
 	}
 	if o.Limit > 0 && len(jobs) > o.Limit {
 		jobs = jobs[:o.Limit]
 	}
-	for i := 0; i < len(jobs) && ctx.Err() == nil; i += imageBatch {
-		batch := jobs[i:min(i+imageBatch, len(jobs))]
-		ins := make([]embed.Input, len(batch))
-		for j, b := range batch {
-			ins[j] = embed.Input{Image: b.path}
-		}
-		vecs, err := e.cl.Embed(ctx, ins)
-		if err != nil {
-			// One unreadable image should not sink the batch: retry singly.
-			for j, b := range batch {
-				v, err := e.cl.EmbedOne(ctx, ins[j])
-				if err != nil {
-					stats.Failed++
-					if len(stats.Errors) < 10 {
-						stats.Errors = append(stats.Errors, fmt.Sprintf("local:%d: %v", b.id, err))
-					}
-					continue
-				}
-				if err := e.st.PutVector(b.id, store.VecImage, e.modelID(), b.hash, v); err != nil {
-					return err
-				}
-				stats.Images++
-			}
-		} else {
-			for j, b := range batch {
-				if err := e.st.PutVector(b.id, store.VecImage, e.modelID(), b.hash, vecs[j]); err != nil {
-					return err
-				}
-				stats.Images++
-			}
-		}
-		progress("image", min(i+imageBatch, len(jobs)), len(jobs))
+	n, err := e.runJobs(ctx, store.VecImage, jobs, imageBatch, stats, func(done int) { progress("image", done, len(jobs)) })
+	stats.Images += n
+	if err != nil {
+		return fmt.Errorf("embed images: %w", err)
 	}
 	return nil
 }
@@ -363,7 +431,5 @@ func (e *Engine) Refresh(ctx context.Context, ids ...int64) {
 	if len(ids) == 0 || !e.available(ctx) {
 		return
 	}
-	if _, err := e.Backfill(ctx, BackfillOptions{Text: true, Images: true, IDs: ids}); err != nil {
-		e.fail(err)
-	}
+	_, _ = e.Backfill(ctx, BackfillOptions{Text: true, Images: true, IDs: ids})
 }

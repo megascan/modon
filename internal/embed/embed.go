@@ -58,12 +58,25 @@ type Input struct {
 
 // Info describes the server behind the endpoint.
 type Info struct {
-	Model  string `json:"model"`
-	Vision bool   `json:"vision"`
-	Dims   int    `json:"dims"`
-	Device string `json:"device,omitempty"`
-	Dtype  string `json:"dtype,omitempty"`
+	Model           string `json:"model"`
+	Vision          bool   `json:"vision"`
+	Dims            int    `json:"dims"`
+	Device          string `json:"device,omitempty"`
+	PreferredDevice string `json:"preferred_device,omitempty"`
+	Dtype           string `json:"dtype,omitempty"`
+	OOMEvents       int    `json:"oom_events,omitempty"`
 }
+
+// Health-check timing: a successful probe or request is trusted for
+// healthyTTL, a failed one is not retried for failedTTL, and server info is
+// re-read after infoTTL so a restarted server (new device, vision on/off)
+// is noticed.
+var (
+	healthyTTL   = 10 * time.Second
+	failedTTL    = 3 * time.Second
+	infoTTL      = 60 * time.Second
+	probeTimeout = 3 * time.Second
+)
 
 // Client embeds through one endpoint at a fixed output dimension.
 type Client struct {
@@ -72,8 +85,12 @@ type Client struct {
 	Dims     int
 	http     *http.Client
 
-	mu   sync.Mutex
-	info *Info
+	mu       sync.Mutex
+	info     *Info
+	infoAt   time.Time
+	lastOK   time.Time
+	lastFail time.Time
+	lastErr  error
 }
 
 // New returns a client. dims is the Matryoshka truncation (768/512/256/128).
@@ -92,46 +109,150 @@ func New(endpoint, model string, dims int, timeout time.Duration) *Client {
 	}
 }
 
-// Info probes the server once (GET /modon/info). OpenAI-compatible servers
-// without that route are treated as text-only.
-func (c *Client) Info(ctx context.Context) (Info, error) {
+// StatusError is a non-200 answer from the server.
+type StatusError struct {
+	Code int
+	Msg  string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("embedding server: %d %s: %s", e.Code, http.StatusText(e.Code), e.Msg)
+}
+
+// InputError is a problem with one input (e.g. an unreadable image); it is
+// never worth retrying.
+type InputError struct {
+	Index int
+	Err   error
+}
+
+func (e *InputError) Error() string { return fmt.Sprintf("input %d: %v", e.Index, e.Err) }
+func (e *InputError) Unwrap() error { return e.Err }
+
+// Transient reports errors worth retrying: the server is down, restarting,
+// timed out, or ran out of GPU memory (503). Bad input (400) is permanent.
+func Transient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code == http.StatusServiceUnavailable || se.Code == http.StatusBadGateway ||
+			se.Code == http.StatusGatewayTimeout || se.Code == http.StatusTooManyRequests ||
+			se.Code == http.StatusInternalServerError
+	}
+	var ie *InputError
+	return !errors.As(err, &ie) && !errors.Is(err, ErrNoVision) && !errors.Is(err, context.Canceled)
+}
+
+// Unreachable reports errors meaning nothing answered at the endpoint
+// (as opposed to the server answering with an error).
+func Unreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *StatusError
+	return !errors.As(err, &se) && Transient(err)
+}
+
+func (c *Client) markOK() {
+	c.mu.Lock()
+	c.lastOK, c.lastErr = time.Now(), nil
+	c.mu.Unlock()
+}
+
+func (c *Client) markFailed(err error) {
+	c.mu.Lock()
+	c.lastOK, c.lastFail, c.lastErr = time.Time{}, time.Now(), err
+	c.info = nil // re-read once it answers again
+	c.mu.Unlock()
+}
+
+// Healthy reports whether the server answers, probing GET /modon/info at
+// most once per healthyTTL while it is up and once per failedTTL while it
+// is down. Embedding requests count as probes.
+func (c *Client) Healthy(ctx context.Context) error {
+	c.mu.Lock()
+	switch {
+	case time.Since(c.lastOK) < healthyTTL:
+		c.mu.Unlock()
+		return nil
+	case c.lastErr != nil && time.Since(c.lastFail) < failedTTL:
+		err := c.lastErr
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Unlock()
+	_, err := c.probe(ctx)
+	return err
+}
+
+// LastError is the most recent failure, nil after a success.
+func (c *Client) LastError() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.info != nil {
-		return *c.info, nil
+	return c.lastErr
+}
+
+// Info returns the server description, re-reading it after infoTTL.
+// OpenAI-compatible servers without /modon/info are treated as text-only.
+func (c *Client) Info(ctx context.Context) (Info, error) {
+	c.mu.Lock()
+	if c.info != nil && time.Since(c.infoAt) < infoTTL {
+		info := *c.info
+		c.mu.Unlock()
+		return info, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Endpoint+"/modon/info", nil)
+	c.mu.Unlock()
+	return c.probe(ctx)
+}
+
+func (c *Client) probe(ctx context.Context) (Info, error) {
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, c.Endpoint+"/modon/info", nil)
 	if err != nil {
 		return Info{}, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		c.markFailed(err)
 		return Info{}, err
 	}
 	defer resp.Body.Close()
 	info := Info{Model: c.Model}
-	if resp.StatusCode == http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusOK:
 		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-			return Info{}, fmt.Errorf("embedding server info: %w", err)
+			err = fmt.Errorf("embedding server info: %w", err)
+			c.markFailed(err)
+			return Info{}, err
 		}
+	case resp.StatusCode >= 500:
+		err := &StatusError{resp.StatusCode, "info"}
+		c.markFailed(err)
+		return Info{}, err
 	}
 	// Vectors are keyed by the configured model id so switching servers for
 	// the same weights does not invalidate the index.
 	info.Model = c.Model
-	c.info = &info
+	c.mu.Lock()
+	c.info, c.infoAt = &info, time.Now()
+	c.lastOK, c.lastErr = time.Now(), nil
+	c.mu.Unlock()
 	return info, nil
 }
 
-// Reset forgets the probed server info (e.g. after the sidecar restarts).
+// Reset forgets the probed server state (e.g. after the sidecar restarts).
 func (c *Client) Reset() {
 	c.mu.Lock()
-	c.info = nil
+	c.info, c.lastOK, c.lastFail, c.lastErr = nil, time.Time{}, time.Time{}, nil
 	c.mu.Unlock()
 }
 
-// Ping reports whether the server answers.
+// Ping probes the server now, bypassing the health cache.
 func (c *Client) Ping(ctx context.Context) error {
-	_, err := c.Info(ctx)
+	_, err := c.probe(ctx)
 	return err
 }
 
@@ -171,7 +292,7 @@ func (c *Client) Embed(ctx context.Context, inputs []Input) ([][]float32, error)
 		}
 		img, err := imageRef(in.Image)
 		if err != nil {
-			return nil, err
+			return nil, &InputError{Index: i, Err: err}
 		}
 		items[i] = map[string]string{"text": in.Text, "image": img}
 	}
@@ -183,6 +304,9 @@ func (c *Client) Embed(ctx context.Context, inputs []Input) ([][]float32, error)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			c.markFailed(err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -192,11 +316,22 @@ func (c *Client) Embed(ctx context.Context, inputs []Input) ([][]float32, error)
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg := strings.TrimSpace(string(raw))
+		var body struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(raw, &body) == nil && body.Error.Message != "" {
+			msg = body.Error.Message
+		}
 		if len(msg) > 300 {
 			msg = msg[:300]
 		}
-		return nil, fmt.Errorf("embedding server: %s: %s", resp.Status, msg)
+		// The server answered, so it is alive even when it refuses work.
+		c.markOK()
+		return nil, &StatusError{resp.StatusCode, msg}
 	}
+	c.markOK()
 	var er embedResponse
 	if err := json.Unmarshal(raw, &er); err != nil {
 		return nil, fmt.Errorf("embedding server: %w", err)

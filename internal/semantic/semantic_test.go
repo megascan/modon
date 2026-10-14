@@ -214,7 +214,7 @@ func TestHybridSearchFindsParaphrases(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(res) == 0 || res[0].RowID != f.ids["SM Prop 01"] {
-		t.Fatalf("semantic search for couch: %+v (lastErr=%q)", res, f.eng.lastErr)
+		t.Fatalf("semantic search for couch: %+v (lastErr=%v)", res, f.eng.cl.LastError())
 	}
 	if res[0].Score <= 0 || len(res[0].MatchedBy) == 0 || res[0].MatchedBy[0] != "text" {
 		t.Fatalf("missing diagnostics: score=%v matched_by=%v", res[0].Score, res[0].MatchedBy)

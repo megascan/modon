@@ -9,8 +9,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -61,12 +59,11 @@ type Engine struct {
 	st  *store.Store
 	cl  *embed.Client
 
-	mu        sync.Mutex
-	queries   map[string][]float32 // small cache of recent query vectors
-	downUntil time.Time
-	lastErr   string
-	labels    *labelSet
-	sidecar   *exec.Cmd
+	mu          sync.Mutex
+	queries     map[string][]float32 // small cache of recent query vectors
+	labels      *labelSet
+	lastEnsure  time.Time // last background start attempt
+	clustersDue bool      // vectors changed since clusters were computed
 }
 
 // New builds the engine; it is inert when embedding.endpoint is unset.
@@ -85,78 +82,74 @@ func (e *Engine) Enabled() bool { return e != nil && e.cl != nil }
 func (e *Engine) modelID() string { return e.cl.Model }
 func (e *Engine) dims() int       { return e.cl.Dims }
 
-// available pings the server, remembering failures briefly so a down
-// sidecar costs one probe per 30s rather than one per search.
+// ensureEvery rate-limits background start attempts.
+const ensureEvery = 30 * time.Second
+
+// available reports whether the server answers. The client caches the
+// answer briefly (healthy for 10s, down for 3s), so a dead server is
+// noticed within seconds and a revived one is picked up again without a
+// restart. When the server is down and embedding.autostart is set, a start
+// is kicked off in the background (at most every 30s); this call still
+// returns false so the caller degrades to keyword search meanwhile.
 func (e *Engine) available(ctx context.Context) bool {
 	if !e.Enabled() {
 		return false
 	}
-	e.mu.Lock()
-	if time.Now().Before(e.downUntil) {
-		e.mu.Unlock()
-		return false
+	err := e.cl.Healthy(ctx)
+	if err == nil {
+		return true
 	}
-	e.mu.Unlock()
-	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if err := e.cl.Ping(pctx); err != nil {
-		e.fail(err)
+	if e.cfg.Embedding.Autostart && embed.Unreachable(err) {
 		e.mu.Lock()
-		e.downUntil = time.Now().Add(30 * time.Second)
+		due := time.Since(e.lastEnsure) >= ensureEvery
+		if due {
+			e.lastEnsure = time.Now()
+		}
 		e.mu.Unlock()
-		return false
+		if due {
+			go func() { _ = e.ensure(context.WithoutCancel(ctx), 0) }()
+		}
 	}
-	return true
-}
-
-func (e *Engine) fail(err error) {
-	e.mu.Lock()
-	e.lastErr = err.Error()
-	e.mu.Unlock()
+	return false
 }
 
 // Reachable reports whether the embedding server answers right now.
 func (e *Engine) Reachable(ctx context.Context) bool { return e.available(ctx) }
 
-// Start launches the bundled sidecar when embedding.autostart is set and
-// nothing answers at the endpoint. It returns immediately when wait is 0;
-// the sidecar keeps loading in the background.
+// Start makes sure the embedding server runs when embedding.autostart is
+// set: it reuses a running server, otherwise starts the systemd user unit
+// (modon service install) or a detached `modon embed-server` that outlives
+// this process. It waits up to wait for the server to answer (0 = do not
+// wait; the server keeps loading in the background).
 func (e *Engine) Start(ctx context.Context, wait time.Duration) error {
 	if !e.Enabled() || !e.cfg.Embedding.Autostart {
 		return nil
 	}
+	e.mu.Lock()
+	e.lastEnsure = time.Now()
+	e.mu.Unlock()
+	return e.ensure(ctx, wait)
+}
+
+func (e *Engine) ensure(ctx context.Context, wait time.Duration) error {
 	cache, err := config.CacheDir()
 	if err != nil {
 		return err
 	}
-	ec := e.cfg.Embedding
-	opts := embed.SidecarOptions{
-		UV: ec.UVPath, CacheDir: cache, Endpoint: ec.Endpoint,
-		ImageTokens: ec.ImageTokens, Device: ec.Device,
+	err = embed.Ensure(ctx, e.cl, embed.EnsureOptions{
+		CacheDir: cache,
+		LogPath:  filepath.Join(cache, "embed_server.log"),
+		Wait:     wait,
+	})
+	if err == nil {
+		e.cl.Reset() // re-read server info (device, vision)
 	}
-	cmd, err := embed.Start(ctx, e.cl, opts, filepath.Join(cache, "embed_server.log"), wait)
-	e.mu.Lock()
-	if cmd != nil {
-		e.sidecar = cmd
-	}
-	e.downUntil = time.Time{}
-	e.mu.Unlock()
 	return err
 }
 
-// Close stops a sidecar this engine started.
-func (e *Engine) Close() {
-	if e == nil {
-		return
-	}
-	e.mu.Lock()
-	cmd := e.sidecar
-	e.sidecar = nil
-	e.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(os.Interrupt)
-	}
-}
+// Close releases engine resources. The embedding server is shared with
+// other modon processes and keeps running.
+func (e *Engine) Close() {}
 
 // ---- query embedding + scoring ----
 
@@ -442,7 +435,6 @@ func (e *Engine) Search(ctx context.Context, q model.Query) ([]model.Asset, erro
 	if q.Text != "" {
 		qv, err := e.queryVec(ctx, q.Text)
 		if err != nil {
-			e.fail(err)
 			return e.st.Search(q)
 		}
 		if usable(textM, imageM) {
@@ -631,12 +623,16 @@ func (e *Engine) statusHint() string {
 	if !e.Enabled() {
 		return "set embedding.endpoint, e.g. `modon config set embedding.endpoint http://127.0.0.1:8178` and run `modon embed-server`"
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.lastErr != "" {
-		return "server at " + e.cl.Endpoint + " unavailable: " + e.lastErr
+	hint := "server at " + e.cl.Endpoint + " unavailable"
+	if err := e.cl.LastError(); err != nil {
+		hint += ": " + err.Error()
 	}
-	return "server at " + e.cl.Endpoint + " unavailable"
+	if e.cfg.Embedding.Autostart {
+		hint += " (starting it in the background; keyword search meanwhile)"
+	} else {
+		hint += " (run `modon service install` or `modon embed-server`)"
+	}
+	return hint
 }
 
 // Status summarizes the semantic layer for index_stats.
@@ -650,11 +646,15 @@ func (e *Engine) Status(ctx context.Context) map[string]any {
 	out["model"] = e.cl.Model
 	out["dims"] = e.cl.Dims
 	out["vectors"] = e.st.VectorCounts()
-	if e.available(ctx) {
+	out["autostart"] = e.cfg.Embedding.Autostart
+	out["service_installed"] = embed.UnitInstalled()
+	// A fresh probe: status must never report a dead server as reachable.
+	if err := e.cl.Ping(ctx); err == nil {
 		info, _ := e.cl.Info(ctx)
 		out["server"] = info
 		out["reachable"] = true
 	} else {
+		e.available(ctx) // kicks off a background start when autostart is on
 		out["reachable"] = false
 		out["hint"] = e.statusHint()
 	}
