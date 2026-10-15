@@ -441,3 +441,46 @@ func clusterMembers(ctx context.Context, q querier, cluster int64, needsReviewOn
 	}
 	return ids, rows.Err()
 }
+
+// Heuristics are importer-derived values for SetHeuristics.
+type Heuristics struct {
+	Category  string
+	Style     string
+	AssetType string
+	Tags      []string
+}
+
+// SetHeuristics refreshes an asset's heuristic metadata the way a re-import
+// does, without re-reading the file: agent-written fields are never touched
+// (the check is in the UPDATE itself, so an edit landing in between still
+// wins), a zero-shot or heuristic value is replaced only by a non-empty
+// one, and heuristic tags are rewritten unless an agent owns the list.
+// Descriptions and the review flag are left alone. It reports whether the
+// row changed.
+func (s *Store) SetHeuristics(id int64, h Heuristics) (bool, error) {
+	tags := joinTags(h.Tags)
+	res, err := s.db.Exec(`UPDATE assets SET
+		category = CASE WHEN category_src = 'agent' OR ? = '' THEN category ELSE ? END,
+		category_src = CASE WHEN category_src = 'agent' OR ? = '' THEN category_src ELSE '' END,
+		style = CASE WHEN style_src = 'agent' OR ? = '' THEN style ELSE ? END,
+		style_src = CASE WHEN style_src = 'agent' OR ? = '' THEN style_src ELSE '' END,
+		asset_type = CASE WHEN type_src = 'agent' OR ? = '' THEN asset_type ELSE ? END,
+		type_src = CASE WHEN type_src = 'agent' OR ? = '' THEN type_src ELSE '' END,
+		tags = CASE WHEN tags_src = 'agent' THEN tags ELSE ? END,
+		updated_at = ?
+		WHERE id = ? AND (
+			(category_src != 'agent' AND ? != '' AND (category != ? OR category_src != '')) OR
+			(style_src != 'agent' AND ? != '' AND (style != ? OR style_src != '')) OR
+			(type_src != 'agent' AND ? != '' AND (asset_type != ? OR type_src != '')) OR
+			(tags_src != 'agent' AND tags != ?))`,
+		h.Category, h.Category, h.Category,
+		h.Style, h.Style, h.Style,
+		h.AssetType, h.AssetType, h.AssetType,
+		tags, now(), id,
+		h.Category, h.Category, h.Style, h.Style, h.AssetType, h.AssetType, tags)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}

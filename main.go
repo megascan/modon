@@ -77,6 +77,8 @@ func main() {
 		err = cmdUpdate(args)
 	case "dedupe":
 		err = cmdDedupe(args)
+	case "reclassify":
+		err = cmdReclassify(args)
 	case "similar":
 		err = cmdSimilar(args)
 	case "suggest":
@@ -125,6 +127,7 @@ Usage:
   modon unclassified [flags]    Review queue: page, claim batches for a worker
   modon update [flags] <id>...  Write agent metadata (tags merge/replace/remove)
   modon dedupe                  Recompute duplicate clusters (FBX/OBJ copies, shared props)
+  modon reclassify [--apply]    Re-run import heuristics on indexed assets (never agent edits)
   modon config [get|set|path]   Inspect or change configuration
   modon stats                   Local index statistics + config status
   modon help | version

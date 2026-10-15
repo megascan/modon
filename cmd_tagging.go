@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	importdir "modon/internal/importer"
 	"modon/internal/semantic"
 	"modon/internal/server"
 	"modon/internal/store"
@@ -221,5 +223,46 @@ func cmdDedupe(_ []string) error {
 		return err
 	}
 	printJSON(ds)
+	return nil
+}
+
+func cmdReclassify(args []string) error {
+	fs := flag.NewFlagSet("reclassify", flag.ContinueOnError)
+	apply := fs.Bool("apply", false, "write the changes (default: dry run)")
+	limit := fs.Int("limit", 0, "consider only the first N assets (0 = all)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	d, err := openDeps()
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	last := time.Time{}
+	s, err := importdir.Reclassify(context.Background(), d.St, importdir.ReclassifyOptions{
+		Apply: *apply, Limit: *limit,
+		Progress: func(done, total int) {
+			if done == total || time.Since(last) > 5*time.Second {
+				last = time.Now()
+				fmt.Fprintf(os.Stderr, "reclassify %d/%d\n", done, total)
+			}
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(s)
+	} else {
+		fmt.Printf("%d asset(s) considered, %d with changed heuristics, %d category change(s); %d agent categories kept; %d unreadable (stored metadata used)\n",
+			s.Considered, s.Changed, s.CategoryMoves, s.AgentProtected, s.Unreadable)
+		for _, k := range s.SortedChanges() {
+			fmt.Printf("  %5d  %s  e.g. %s\n", s.Changes[k], k, strings.Join(s.Examples[k], "; "))
+		}
+	}
+	if !*apply && s.Changed > 0 {
+		fmt.Fprintln(os.Stderr, "dry run: add --apply to write these changes (agent-written fields are never touched)")
+	}
 	return nil
 }
