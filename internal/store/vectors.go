@@ -219,18 +219,22 @@ func (s *Store) GetByIDs(ids []int64) ([]model.Asset, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := s.db.Query(`SELECT `+selectCols+` FROM assets WHERE id IN (`+ph+`)`, args...)
-	if err != nil {
-		return nil, err
-	}
 	byID := map[int64]model.Asset{}
-	for _, a := range collect(rows) {
-		byID[a.RowID] = a
+	// Chunked: batch edits can name thousands of assets.
+	for start := 0; start < len(ids); start += 500 {
+		chunk := ids[start:min(start+500, len(ids))]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		rows, err := s.db.Query(`SELECT `+selectCols+` FROM assets WHERE id IN (`+ph+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range collect(rows) {
+			byID[a.RowID] = a
+		}
 	}
 	out := make([]model.Asset, 0, len(ids))
 	for _, id := range ids {

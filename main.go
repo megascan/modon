@@ -174,6 +174,7 @@ Update flags:
   --tags a,b --tags-mode merge|replace --remove-tags x,y
   --duplicates (also edit every copy in each asset's duplicate cluster)
   --reviewed / --unreviewed (force the review flag)
+  --batch FILE|- (JSON Lines edits, one per line, re-embedded once at the end)
 
 Examples:
   modon setup --previews ~/Assets/Models

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"modon/internal/semantic"
@@ -79,22 +83,29 @@ func splitList(s string) []string {
 
 func cmdUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	desc := fs.String("description", "", "")
-	category := fs.String("category", "", "")
-	style := fs.String("style", "", "")
-	atype := fs.String("type", "", "")
-	tags := fs.String("tags", "", "comma-separated")
-	mode := fs.String("tags-mode", "", "merge | replace")
-	remove := fs.String("remove-tags", "", "comma-separated")
+	desc := fs.String("description", "", "description (agent-written)")
+	category := fs.String("category", "", "canonical category")
+	style := fs.String("style", "", "art-style descriptors")
+	atype := fs.String("type", "", "model | animation | material | texture | other")
+	tags := fs.String("tags", "", "comma-separated tags")
+	mode := fs.String("tags-mode", "", "merge (default) | replace")
+	remove := fs.String("remove-tags", "", "comma-separated tags to delete")
 	dups := fs.Bool("duplicates", false, "also edit every copy in the duplicate cluster")
-	rev := fs.Bool("reviewed", false, "")
-	unrev := fs.Bool("unreviewed", false, "")
-	asJSON := fs.Bool("json", false, "")
+	rev := fs.Bool("reviewed", false, "force needs_review off")
+	unrev := fs.Bool("unreviewed", false, "force needs_review on")
+	batch := fs.String("batch", "", "JSON Lines file of edits (- = stdin); one re-embed pass at the end")
+	asJSON := fs.Bool("json", false, "JSON output")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	if *batch != "" {
+		if fs.NArg() > 0 {
+			return fmt.Errorf("--batch takes its ids from the file; drop the positional ids")
+		}
+		return updateBatch(*batch, *asJSON)
+	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: modon update [flags] local:<id> [local:<id>...]")
+		return fmt.Errorf("usage: modon update [flags] local:<id> [local:<id>...] | modon update --batch edits.jsonl")
 	}
 	u := store.MetadataUpdate{
 		Description: *desc, Category: *category, Style: *style, AssetType: *atype,
@@ -118,6 +129,80 @@ func cmdUpdate(args []string) error {
 		}
 	}
 	return err
+}
+
+// readBatch parses JSON Lines edits (blank lines and # comments skipped).
+// A JSON array of edits is accepted too.
+func readBatch(r io.Reader) ([]server.UpdateItem, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if t := bytes.TrimSpace(data); len(t) > 0 && t[0] == '[' {
+		var items []server.UpdateItem
+		if err := json.Unmarshal(t, &items); err != nil {
+			return nil, fmt.Errorf("batch array: %w", err)
+		}
+		return items, nil
+	}
+	var items []server.UpdateItem
+	for n, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		var it server.UpdateItem
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.DisallowUnknownFields() // a typo like "tag" must not silently do nothing
+		if err := dec.Decode(&it); err != nil {
+			return nil, fmt.Errorf("batch line %d: %w", n+1, err)
+		}
+		items = append(items, it)
+	}
+	return items, nil
+}
+
+func updateBatch(path string, asJSON bool) error {
+	var r io.Reader = os.Stdin
+	if path != "-" {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		r = f
+	}
+	items, err := readBatch(r)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return fmt.Errorf("the batch has no edits")
+	}
+	d, err := openDeps()
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	res := server.ApplyBatch(context.Background(), d, items)
+	if asJSON {
+		printJSON(res)
+	} else {
+		fmt.Printf("%d edit(s), %d asset(s) updated", res.Items, res.Updated)
+		if e := res.Embedding; e != nil {
+			fmt.Printf(", %d text vector(s) re-embedded", e.Text)
+		} else {
+			fmt.Print(", embedding server unavailable (vectors refresh on the next embed)")
+		}
+		fmt.Println()
+		for _, e := range res.Errors {
+			fmt.Printf("error: item %d %s: %s\n", e.Item, e.ID, e.Error)
+		}
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("%d of %d edit(s) failed", len(res.Errors), res.Items)
+	}
+	return nil
 }
 
 func cmdDedupe(_ []string) error {
