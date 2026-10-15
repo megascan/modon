@@ -28,6 +28,8 @@ func cmdUnclassified(args []string) error {
 	onePer := fs.Bool("one-per-cluster", false, "one representative per duplicate cluster")
 	release := fs.Bool("release", false, "release the worker's claims")
 	asJSON := fs.Bool("json", false, "JSON output (also for --release)")
+	withSuggest := fs.Bool("with-suggest", false, "inline ranked category/style/tag candidates per asset (implies --json)")
+	suggestTop := fs.Int("suggest-top", 3, "candidates per list with --with-suggest")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -53,6 +55,20 @@ func cmdUnclassified(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if *withSuggest {
+		startSidecar(d, 0)
+		items, err := server.WithSuggestions(context.Background(), d, page.Assets, *suggestTop)
+		out := map[string]any{"count": len(items), "assets": items, "remaining": page.Remaining}
+		if page.Worker != "" {
+			out["worker"], out["lease_expires_at"] = page.Worker, page.LeaseExpiresAt
+		}
+		if err != nil {
+			// The batch is claimed already: hand it out without them.
+			out["suggest_error"] = err.Error()
+		}
+		printJSON(out)
+		return nil
 	}
 	if *asJSON {
 		printJSON(page)

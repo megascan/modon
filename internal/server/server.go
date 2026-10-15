@@ -106,8 +106,8 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "suggest_metadata",
-		Description: "Zero-shot category and art-style guesses for a local asset from its preview image and text, with scores and a confidence margin. Use while enriching list_unclassified results, then write the result with update_asset_metadata. Needs semantic search.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in IDInput) (*mcp.CallToolResult, any, error) {
+		Description: "Ranked metadata candidates for local assets, to tag deeper than the file name: zero-shot categories, art styles and tags from the recommended vocabulary (material, theme, condition, use, kitbash role; each with its facet) matched against the preview image and text, with scores and a category confidence margin; plus neighbor_tags and neighbor_categories, what agents already wrote on the most similar agent-tagged assets (score = similarity-weighted share, count = how many of the neighbors). Treat them as candidates to confirm against the preview, then write with update_asset_metadata. Pass ids for several assets at once (list_unclassified with_suggestions inlines them). Needs semantic search.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in SuggestInput) (*mcp.CallToolResult, any, error) {
 		return handleSuggest(ctx, d, in)
 	})
 
@@ -155,7 +155,7 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_unclassified",
-		Description: "List local assets that still need review, largest files first. Page with offset. For parallel tagging, pass worker (any id unique to you): the returned assets are claimed for you for lease_seconds (default 900) and other workers get disjoint batches; claims are released as you update each asset, and release=true drops your remaining claims. one_per_cluster returns one representative per duplicate cluster (its duplicates are listed and claimed too) so you can tag it once with apply_to_duplicates.",
+		Description: "List local assets that still need review, largest files first. Page with offset. For parallel tagging, pass worker (any id unique to you): the returned assets are claimed for you for lease_seconds (default 900) and other workers get disjoint batches; claims are released as you update each asset, and release=true drops your remaining claims. one_per_cluster returns one representative per duplicate cluster (its duplicates are listed and claimed too) so you can tag it once with apply_to_duplicates. with_suggestions inlines suggest_metadata candidates for every asset (one call per batch); write the batch back with update_asset_metadata items.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
 		return handleUnclassified(ctx, d, in)
 	})
@@ -270,6 +270,15 @@ type UnclassifiedInput struct {
 	LeaseSeconds  int    `json:"lease_seconds,omitempty" jsonschema:"How long claims last, default 900"`
 	OnePerCluster bool   `json:"one_per_cluster,omitempty" jsonschema:"One representative per duplicate cluster; its duplicates are listed (and claimed with worker)"`
 	Release       bool   `json:"release,omitempty" jsonschema:"With worker: release your remaining claims instead of listing"`
+
+	WithSuggestions bool `json:"with_suggestions,omitempty" jsonschema:"Inline suggest_metadata candidates (categories, styles, vocabulary tags, neighbor tags) for each asset; needs semantic search"`
+	SuggestTop      int  `json:"suggest_top,omitempty" jsonschema:"Candidates per list with with_suggestions, default 3"`
+}
+
+type SuggestInput struct {
+	ID   string   `json:"id,omitempty" jsonschema:"Local asset id: local:<rowid>"`
+	IDs  []string `json:"ids,omitempty" jsonschema:"Several local asset ids (instead of id)"`
+	TopK int      `json:"top_k,omitempty" jsonschema:"Candidates per list, default 3 (neighbor tags get 4x)"`
 }
 
 type EmptyInput struct{}
@@ -614,7 +623,7 @@ func LocalID(ref string) (int64, error) {
 	return id, nil
 }
 
-func handleUnclassified(_ context.Context, d *Deps, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
+func handleUnclassified(ctx context.Context, d *Deps, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
 	var payload any
 	if in.Release {
 		n, err := d.St.ReleaseClaims(in.Worker)
@@ -634,12 +643,48 @@ func handleUnclassified(_ context.Context, d *Deps, in UnclassifiedInput) (*mcp.
 		if page.Worker != "" {
 			m["worker"], m["lease_expires_at"] = page.Worker, page.LeaseExpiresAt
 		}
+		if in.WithSuggestions {
+			items, err := WithSuggestions(ctx, d, page.Assets, in.SuggestTop)
+			m["assets"] = items
+			if err != nil {
+				// The batch is claimed already: hand it out without them.
+				m["suggest_error"] = err.Error()
+			}
+		}
 		payload = m
 	}
 	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
 	}, payload, nil
+}
+
+// ReviewItem is a review-queue asset with its inlined suggestions.
+type ReviewItem struct {
+	model.Asset
+	Suggestions *semantic.Suggestions `json:"suggestions,omitempty"`
+}
+
+// WithSuggestions attaches suggestions to a review page. On error (no
+// embedding server) the assets come back without them.
+func WithSuggestions(ctx context.Context, d *Deps, assets []model.Asset, k int) ([]ReviewItem, error) {
+	items := make([]ReviewItem, len(assets))
+	ids := make([]int64, len(assets))
+	for i, a := range assets {
+		items[i].Asset = a
+		ids[i] = a.RowID
+	}
+	if len(ids) == 0 {
+		return items, nil
+	}
+	sgs, err := d.Sem.SuggestMany(ctx, ids, k)
+	if err != nil {
+		return items, err
+	}
+	for i := range items {
+		items[i].Suggestions = sgs[i]
+	}
+	return items, nil
 }
 
 func handleStats(ctx context.Context, d *Deps, _ EmptyInput) (*mcp.CallToolResult, any, error) {
@@ -720,26 +765,37 @@ func handleSimilar(ctx context.Context, d *Deps, in SimilarInput) (*mcp.CallTool
 	}, payload, nil
 }
 
-func handleSuggest(ctx context.Context, d *Deps, in IDInput) (*mcp.CallToolResult, any, error) {
-	src, rid, err := source.SplitID(in.ID)
+func handleSuggest(ctx context.Context, d *Deps, in SuggestInput) (*mcp.CallToolResult, any, error) {
+	refs := in.IDs
+	if in.ID != "" {
+		refs = append([]string{in.ID}, refs...)
+	}
+	if len(refs) == 0 {
+		return errResult(fmt.Errorf("id (or ids) is required, e.g. local:3")), nil, nil
+	}
+	ids := make([]int64, len(refs))
+	for i, ref := range refs {
+		id, err := LocalID(ref)
+		if err != nil {
+			return errResult(fmt.Errorf("suggestions are for local assets: %w", err)), nil, nil
+		}
+		ids[i] = id
+	}
+	sgs, err := d.Sem.SuggestMany(ctx, ids, in.TopK)
 	if err != nil {
 		return errResult(err), nil, nil
 	}
-	if src != model.SourceLocal {
-		return errResult(fmt.Errorf("suggestions are for local assets, got %q", in.ID)), nil, nil
+	var payload any = map[string]any{"count": len(sgs), "suggestions": sgs}
+	if len(sgs) == 1 {
+		if sgs[0].Error != "" {
+			return errResult(errors.New(sgs[0].Error)), nil, nil
+		}
+		payload = sgs[0] // one id keeps the original response shape
 	}
-	rowID, err := strconv.ParseInt(rid, 10, 64)
-	if err != nil {
-		return errResult(fmt.Errorf("local asset ids are numeric, got %q", in.ID)), nil, nil
-	}
-	sg, err := d.Sem.Suggest(ctx, rowID)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	text, _ := json.MarshalIndent(sg, "", "  ")
+	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
-	}, sg, nil
+	}, payload, nil
 }
 
 func handleEmbed(ctx context.Context, d *Deps, in EmbedInput) (*mcp.CallToolResult, any, error) {

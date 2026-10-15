@@ -29,6 +29,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"modon/internal/classify"
 	"modon/internal/config"
 	"modon/internal/embed"
 	importdir "modon/internal/importer"
@@ -123,7 +124,7 @@ Usage:
   modon service install|uninstall|status|print
                                 Keep the embedding server up as a systemd user unit
   modon similar [flags] <id>    Owned assets that look like <id> (local or remote)
-  modon suggest <id>            Zero-shot category/style guesses for a local asset
+  modon suggest [flags] <id>... Ranked category/style/tag candidates for local assets
   modon unclassified [flags]    Review queue: page, claim batches for a worker
   modon update [flags] <id>...  Write agent metadata (tags merge/replace/remove)
   modon dedupe                  Recompute duplicate clusters (FBX/OBJ copies, shared props)
@@ -171,6 +172,7 @@ Embed-server flags:
 
 Unclassified flags (bulk tagging):
   --limit N --offset N --worker ID --lease 15m --one-per-cluster --json
+  --with-suggest [--suggest-top N] (inline suggest candidates; implies --json)
   --release (with --worker: drop that worker's remaining claims; --json too)
 Update flags:
   --description D --category C --style S --type T
@@ -178,6 +180,8 @@ Update flags:
   --duplicates (also edit every copy in each asset's duplicate cluster)
   --reviewed / --unreviewed (force the review flag)
   --batch FILE|- (JSON Lines edits, one per line, re-embedded once at the end)
+Suggest flags:
+  --top N (candidates per list, default 3)   --vocabulary (print the tag vocabulary)
 
 Examples:
   modon setup --previews ~/Assets/Models
@@ -930,12 +934,26 @@ func cmdSimilar(args []string) error {
 }
 
 func cmdSuggest(args []string) error {
-	if len(args) < 1 || !strings.HasPrefix(args[0], "local:") {
-		return fmt.Errorf("usage: modon suggest local:<id>")
-	}
-	id, err := strconv.ParseInt(strings.TrimPrefix(args[0], "local:"), 10, 64)
-	if err != nil {
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	topK := fs.Int("top", 3, "candidates per list (neighbor tags get 4x)")
+	vocab := fs.Bool("vocabulary", false, "print the recommended tag vocabulary and exit")
+	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if *vocab {
+		printJSON(classify.TagVocabulary)
+		return nil
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: modon suggest [--top N] local:<id> [local:<id>...] | modon suggest --vocabulary")
+	}
+	ids := make([]int64, fs.NArg())
+	for i, ref := range fs.Args() {
+		id, err := server.LocalID(ref)
+		if err != nil {
+			return fmt.Errorf("suggestions are for local assets: %w", err)
+		}
+		ids[i] = id
 	}
 	d, err := openDeps()
 	if err != nil {
@@ -943,11 +961,18 @@ func cmdSuggest(args []string) error {
 	}
 	defer d.Close()
 	startSidecar(d, 0)
-	sg, err := d.Sem.Suggest(context.Background(), id)
+	sgs, err := d.Sem.SuggestMany(context.Background(), ids, *topK)
 	if err != nil {
 		return err
 	}
-	printJSON(sg)
+	if len(sgs) == 1 {
+		if sgs[0].Error != "" {
+			return errors.New(sgs[0].Error)
+		}
+		printJSON(sgs[0])
+		return nil
+	}
+	printJSON(sgs)
 	return nil
 }
 

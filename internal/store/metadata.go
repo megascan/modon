@@ -484,3 +484,30 @@ func (s *Store) SetHeuristics(id int64, h Heuristics) (bool, error) {
 	n, _ := res.RowsAffected()
 	return n > 0, nil
 }
+
+// AgentMeta is the agent-written category and tags of one asset.
+type AgentMeta struct {
+	Category string // "" unless an agent wrote it
+	Tags     []string
+}
+
+// AgentTagged returns every asset whose tag list an agent wrote: the
+// labelled examples tag suggestions learn from.
+func (s *Store) AgentTagged() (map[int64]AgentMeta, error) {
+	rows, err := s.db.Query(`SELECT id, CASE WHEN category_src = 'agent' THEN category ELSE '' END, tags
+		FROM assets WHERE tags_src = 'agent' AND tags != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]AgentMeta{}
+	for rows.Next() {
+		var id int64
+		var cat, tags string
+		if err := rows.Scan(&id, &cat, &tags); err != nil {
+			return nil, err
+		}
+		out[id] = AgentMeta{Category: cat, Tags: strings.Fields(tags)}
+	}
+	return out, rows.Err()
+}

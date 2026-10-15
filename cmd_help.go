@@ -36,7 +36,6 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 var plainUsage = map[string]string{
 	"serve":   "modon [serve]                    run the MCP server over stdio",
 	"details": "modon details <id>               full details (local:N, polypizza:ID, fab:UID)",
-	"suggest": "modon suggest local:<id>         zero-shot category/style guesses",
 	"config":  "modon config [get <key> | set <key> <value> | path]",
 	"service": "modon service install [--no-enable] [--replace] | uninstall | status | print",
 	"stats":   "modon stats                      local index statistics + config status",

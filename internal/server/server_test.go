@@ -184,3 +184,15 @@ func TestUpdateToolSchemaHasItems(t *testing.T) {
 	}
 	t.Fatal("update_asset_metadata not registered")
 }
+
+func TestUnclassifiedWithSuggestionsDegrades(t *testing.T) {
+	d, _ := testDeps(t)
+	res, out, _ := handleUnclassified(context.Background(), d, UnclassifiedInput{Worker: "w", WithSuggestions: true})
+	if res.IsError {
+		t.Fatalf("%+v", res.Content)
+	}
+	m := out.(map[string]any)
+	if m["suggest_error"] == nil || len(m["assets"].([]ReviewItem)) != 3 || m["worker"] != "w" {
+		t.Fatalf("without an embedding server the claimed batch still comes back: %+v", m)
+	}
+}
