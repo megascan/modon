@@ -1,7 +1,8 @@
 # Embedding service, bulk tagging and duplicates
 
 This page covers the shared embedding server, the agent tagging workflow
-(review queue claims, tag modes, provenance) and duplicate clusters. It
+(review queue claims, suggestions, the tag vocabulary, batch writes,
+provenance and reclassification) and duplicate clusters. It
 extends the "Semantic search" section of the README.
 
 ## One embedding server per machine
@@ -92,10 +93,58 @@ CLI: `modon unclassified --worker agent-3 --limit 25 --one-per-cluster --lease 1
   are listed in `duplicates` and claimed too.
 - `offset`: plain paging when not claiming. `remaining` counts unclaimed
   assets still in review.
-- `release: true` (CLI `--release`) gives back the worker's unfinished
-  claims. Expired claims return to the pool by themselves.
+- `release: true` (CLI `--release`, with `--json` for
+  `{"worker", "released"}`) gives back the worker's unfinished claims.
+  Expired claims return to the pool by themselves.
+- `with_suggestions: true` (CLI `--with-suggest`, JSON output) inlines
+  the step-2 suggestions in each asset as `suggestions`, so one call
+  returns a claimed batch ready to tag. `suggest_top` (CLI
+  `--suggest-top`) sets the list length. Without an embedding server
+  the batch still comes back, with `suggest_error`.
 
-### 2. Write metadata
+### 2. Read the suggestions
+
+MCP `suggest_metadata` (`{"ids": ["local:42", "local:43"], "top_k": 3}`),
+CLI `modon suggest [--top N] local:42 local:43`. Per asset:
+
+- `categories`, `styles`: zero-shot matches of the preview image and
+  text document against the category and style labels, with a
+  `margin` between the first two categories (`confident` above 0.05).
+- `tags`: the best terms of each facet of the recommended vocabulary
+  (below), with their `facet`. Zero-shot scores are small numbers that
+  only rank; materials and conditions read from a thumbnail are hints.
+- `neighbor_tags`, `neighbor_categories`: what agents already wrote on
+  the eight most similar agent-tagged assets (`neighbors`, by preview
+  and text similarity). `score` is the similarity-weighted share of
+  neighbours with the label (1.0 = all of them), `count` how many. These
+  get better as more of the library is tagged and reuse its own words;
+  a copy of an already tagged model shows up as a neighbour with
+  similarity near 1.
+
+Confirm candidates against the preview (`get_preview`) before writing
+them; the suggestions are signal, not answers.
+
+### Recommended tag vocabulary
+
+`modon suggest --vocabulary` prints it as JSON. Beyond the object nouns
+(from the name and what the preview shows), tag along these facets:
+
+| facet | about | examples |
+| --- | --- | --- |
+| material | dominant visible material | wood, metal, rusty-metal, stone, concrete, brick, glass, fabric, plastic, rope |
+| theme | era, genre or setting | medieval, fantasy, sci-fi, modern, industrial, military, post-apocalyptic, western, nautical, office |
+| condition | wear and state | clean, worn, dirty, damaged, broken, rusty, burnt, overgrown |
+| use | what the piece is in a scene | prop, wall, floor, ceiling, roof, stairs, debris, signage, lighting, vegetation, weapon-part, vehicle-part, character-part, pickup, icon |
+| kitbash | role when assembling scenes | hero-prop, set-dressing, modular-piece, trim, detail, filler, background, landmark, clutter |
+
+A good tag set has the object, its parts or variants, one or two
+materials, the theme, a use and a kitbash role, e.g. for a crate:
+`crate, wooden, rope-handles, wood, medieval, worn, prop, container,
+set-dressing, clutter`. Use lowercase; multi-word tags are hyphenated.
+Write a one-sentence description too: it is embedded and makes search
+by meaning work for the asset.
+
+### 3. Write metadata
 
 MCP `update_asset_metadata`:
 
@@ -118,6 +167,41 @@ CLI: `modon update --category container --tags crate,wooden,market --tags-mode r
   releases its claim, and its vectors are refreshed right away (only that
   asset is re-embedded).
 
+### Batches
+
+Writing a batch in one go is much faster than one call per asset: every
+edit is stored, then all touched assets are re-embedded together (32
+documents per embedding request) instead of one request per call.
+
+MCP: `update_asset_metadata` with `items`, a list of independent edits
+with the same fields as above:
+
+```json
+{"items": [
+  {"id": "local:42", "description": "Wooden market crate with rope handles",
+   "category": "container", "tags": ["crate", "wood", "medieval", "set-dressing"],
+   "tags_mode": "replace", "apply_to_duplicates": true},
+  {"id": "local:57", "category": "wall", "tags": ["modular-piece", "brick"]}
+]}
+```
+
+CLI: `modon update --batch edits.jsonl` (or `--batch -` for stdin), one
+JSON object per line with the same field names; blank lines and `#`
+comments are skipped and a JSON array works too. Unknown fields are
+rejected with their line number. A failing edit (unknown id, nothing to
+update) is reported with its position and the rest still apply; the
+command then exits 1. `--json` prints the per-asset result and the
+embedding stats.
+
+A typical worker loop:
+
+```sh
+modon unclassified --worker agent-3 --limit 25 --one-per-cluster --with-suggest > batch.json
+# ... look at previews, write edits.jsonl ...
+modon update --batch edits.jsonl --json
+modon unclassified --worker agent-3 --release --json   # when done
+```
+
 ### Provenance
 
 Each metadata field records who wrote it, shown as `provenance` on assets:
@@ -126,6 +210,30 @@ Each metadata field records who wrote it, shown as `provenance` on assets:
 Re-importing a folder refreshes heuristic values but never overwrites agent
 values; an agent's tag list is kept verbatim, so removed tags stay removed.
 Zero-shot values are kept until the importer has a value of its own.
+
+### Refreshing heuristics: `modon reclassify`
+
+When the import heuristics improve, `modon reclassify` re-runs them on
+the indexed files without needing the original import directories (files
+are re-parsed; stored metadata is used for unreadable ones). It is a dry
+run that lists the category moves with counts and examples; `--apply`
+writes them under the re-import rules, enforced in the SQL update itself:
+agent-written fields are never touched (even if an agent edits the asset
+during the run), zero-shot values give way only to a real heuristic
+value, and descriptions and `needs_review` stay. Folder hints come from
+the path below the pack folder, or the last three folders.
+
+The heuristics read the file name first: two-word phrases ("xmas tree"
+is a decoration, "space ship" a spacecraft), then nouns (left to right
+across `_` segments, last word first inside a CamelCase segment, so
+`WallLantern` is a lamp), then naming-convention codes (`Chr`, `Veh`,
+`Wep`, `Bld`), then folders and mesh names. Pieces of characters (hair,
+beards, attachments in a character context) are `character-part`, not
+`character`. `vehicle` means a land vehicle; `aircraft`, `spacecraft`
+and `watercraft` are separate and keep a `vehicle` tag. "Ship",
+"shuttle", "station", "rocket" and "plane" are read in context: space
+words make a spacecraft, a weapon code makes a rocket a weapon, and a
+plane without an air context is a flat quad.
 
 ## Duplicate clusters
 
