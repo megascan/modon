@@ -6,6 +6,7 @@ package classify
 
 import (
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -19,12 +20,21 @@ var categoryKeywords = map[string]string{
 	"shelf": "furniture", "cabinet": "furniture", "wardrobe": "furniture", "bed": "furniture",
 	"furniture": "furniture",
 	"lamp":      "lamp", "lantern": "lamp", "streetlamp": "lamp",
+	// "vehicle" is a land vehicle; air, space and water craft have their own
+	// categories (and get a "vehicle" tag). Words whose meaning depends on
+	// context (ship, shuttle, rocket, station) are in contextual.
 	"car": "vehicle", "truck": "vehicle", "van": "vehicle", "bus": "vehicle", "bike": "vehicle",
 	"motorcycle": "vehicle", "vehicle": "vehicle", "wagon": "vehicle", "kart": "vehicle",
-	"plane": "aircraft", "airplane": "aircraft", "aircraft": "aircraft", "helicopter": "aircraft",
-	"jet":    "aircraft",
-	"rocket": "spacecraft", "spaceship": "spacecraft", "starship": "spacecraft", "shuttle": "spacecraft",
-	"boat": "watercraft", "ship": "watercraft", "sailboat": "watercraft", "submarine": "watercraft",
+	"tractor": "vehicle", "train": "vehicle", "tram": "vehicle", "locomotive": "vehicle", "forklift": "vehicle",
+	"bicycle": "vehicle", "scooter": "vehicle", "taxi": "vehicle", "ambulance": "vehicle", "jeep": "vehicle",
+	"airplane": "aircraft", "aircraft": "aircraft", "helicopter": "aircraft",
+	"jet": "aircraft", "biplane": "aircraft", "airliner": "aircraft", "glider": "aircraft",
+	"blimp": "aircraft", "zeppelin": "aircraft", "airship": "aircraft",
+	"spaceship": "spacecraft", "starship": "spacecraft", "spacecraft": "spacecraft", "ufo": "spacecraft",
+	"satellite": "spacecraft", "starfighter": "spacecraft", "dropship": "spacecraft", "mothership": "spacecraft",
+	"boat": "watercraft", "sailboat": "watercraft", "submarine": "watercraft", "canoe": "watercraft",
+	"kayak": "watercraft", "raft": "watercraft", "yacht": "watercraft", "ferry": "watercraft",
+	"rowboat": "watercraft", "gondola": "watercraft", "jetski": "watercraft", "watercraft": "watercraft",
 	"sword": "weapon", "axe": "weapon", "hammer": "weapon", "gun": "weapon", "rifle": "weapon",
 	"pistol": "weapon", "shotgun": "weapon", "bow": "weapon", "weapon": "weapon", "dagger": "weapon",
 	"knife": "weapon", "staff": "weapon", "wand": "weapon", "spear": "weapon",
@@ -32,6 +42,12 @@ var categoryKeywords = map[string]string{
 	"character": "character", "human": "character", "man": "character", "woman": "character",
 	"girl": "character", "boy": "character", "people": "character", "person": "character",
 	"hero": "character", "npc": "character", "rigged": "character",
+	// Pieces of a character rather than a whole one.
+	"hair": "character-part", "hairstyle": "character-part", "beard": "character-part",
+	"moustache": "character-part", "mustache": "character-part", "eyebrow": "character-part",
+	"eyebrows": "character-part", "eyelashes": "character-part", "ponytail": "character-part",
+	"decoration": "decoration", "ornament": "decoration", "garland": "decoration", "wreath": "decoration",
+	"bauble": "decoration", "tinsel": "decoration",
 	"monster": "creature", "dragon": "creature", "creature": "creature", "alien": "creature",
 	"zombie": "creature", "beast": "creature", "slime": "creature",
 	"dog": "animal", "cat": "animal", "horse": "animal", "cow": "animal", "bird": "animal",
@@ -127,13 +143,7 @@ func Infer(path string, dirTokens []string, m parse.Metadata) Result {
 		res.AssetType = "animation"
 	}
 
-	// Category: first keyword hit wins, scanning most-specific sources.
-	for _, t := range tokens {
-		if c, ok := categoryKeywords[lookup(t)]; ok {
-			res.Category = c
-			break
-		}
-	}
+	res.Category = inferCategory(path, dirTokens, append(append([]string{}, m.MeshNames...), m.MaterialNames...))
 
 	// Style: accumulate matching descriptors.
 	styleSet := map[string]bool{}
@@ -170,6 +180,9 @@ func Infer(path string, dirTokens []string, m parse.Metadata) Result {
 	}
 	if res.Category != "" {
 		add(res.Category)
+		if extra, ok := categoryTags[res.Category]; ok {
+			add(extra)
+		}
 	}
 	matSet := map[string]bool{}
 	for _, n := range m.MaterialNames {
@@ -217,21 +230,252 @@ func lookup(tok string) string {
 	return t
 }
 
-// tokenize splits a path/name into lowercase words.
+// tokenize splits a path/name into lowercase words; CamelCase parts become
+// words of their own ("SpaceShip" -> space, ship).
 func tokenize(s string) []string {
+	var out []string
+	for _, seg := range segments(s) {
+		out = append(out, seg...)
+	}
+	return out
+}
+
+// segments splits a file or directory name at separators, then each
+// separator-delimited segment at CamelCase and letter/digit boundaries:
+// "SM_Prop_WallLantern_01" -> [sm] [prop] [wall lantern] [01].
+func segments(s string) [][]string {
 	base := filepath.Base(s)
-	base = strings.TrimSuffix(base, filepath.Ext(base))
+	if ext := filepath.Ext(base); len(ext) > 1 && len(ext) <= 5 {
+		base = strings.TrimSuffix(base, ext)
+	}
 	f := strings.FieldsFunc(base, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
 	})
-	out := make([]string, 0, len(f))
+	out := make([][]string, 0, len(f))
 	for _, w := range f {
-		w = strings.ToLower(w)
-		if w != "" {
-			out = append(out, w)
+		w = camelBoundary.ReplaceAllString(w, "$1 $2")
+		w = acronymBoundary.ReplaceAllString(w, "$1 $2")
+		w = digitBoundary.ReplaceAllString(w, "$1 $2")
+		w = digitBoundary2.ReplaceAllString(w, "$1 $2")
+		var parts []string
+		for _, p := range strings.Fields(strings.ToLower(w)) {
+			parts = append(parts, p)
+		}
+		if len(parts) > 0 {
+			out = append(out, parts)
 		}
 	}
 	return out
+}
+
+var (
+	camelBoundary   = regexp.MustCompile(`([a-z])([A-Z])`)
+	acronymBoundary = regexp.MustCompile(`([A-Z]+)([A-Z][a-z])`)
+	digitBoundary   = regexp.MustCompile(`([A-Za-z])([0-9])`)
+	digitBoundary2  = regexp.MustCompile(`([0-9])([A-Za-z])`)
+)
+
+// ---- category inference ----
+
+// categoryTags are extra tags for categories that refine a broader one, so
+// filtering by the broad word still finds them.
+var categoryTags = map[string]string{
+	"aircraft": "vehicle", "spacecraft": "vehicle", "watercraft": "vehicle",
+	"character-part": "character", "decoration": "prop",
+}
+
+// phrases are two-word names whose meaning differs from either word.
+var phrases = map[[2]string]string{
+	{"xmas", "tree"}: "decoration", {"christmas", "tree"}: "decoration",
+	{"space", "ship"}: "spacecraft", {"space", "station"}: "spacecraft", {"space", "craft"}: "spacecraft",
+	{"jet", "ski"}: "watercraft", {"tree", "house"}: "building", {"tree", "stump"}: "plant",
+	{"street", "light"}: "lamp", {"street", "lamp"}: "lamp",
+}
+
+// Context word sets that disambiguate words like "ship" and "rocket". They
+// are matched against every word of the file name and its folders.
+var (
+	spaceContext = set("space", "spaceship", "starship", "spacecraft", "galactic", "galaxy", "orbital",
+		"orbit", "planet", "planetary", "asteroid", "satellite", "ufo", "starfighter", "interceptor",
+		"dropship", "mothership")
+	weaponContext    = set("wep", "weapon", "weapons", "gun", "guns", "rpg", "launcher", "ammo", "bazooka", "artillery")
+	airContext       = set("veh", "vehicle", "vehicles", "air", "airport", "airfield", "aviation", "flight", "propeller", "aircraft", "airplane", "wing", "wings", "cockpit")
+	characterContext = set("chr", "character", "characters", "human", "humans", "people", "npc", "avatar")
+)
+
+// contextual resolves words whose category depends on the surroundings.
+var contextual = map[string]func(ctx map[string]bool) string{
+	"ship": func(ctx map[string]bool) string {
+		if spaceCtx(ctx) || scifiCtx(ctx) {
+			return "spacecraft"
+		}
+		return "watercraft"
+	},
+	"shuttle": func(ctx map[string]bool) string { // a badminton shuttle is not a spacecraft
+		if spaceCtx(ctx) || scifiCtx(ctx) {
+			return "spacecraft"
+		}
+		return ""
+	},
+	"station": func(ctx map[string]bool) string { // gas and train stations are not
+		if spaceCtx(ctx) {
+			return "spacecraft"
+		}
+		return ""
+	},
+	"rocket": func(ctx map[string]bool) string {
+		if anyIn(ctx, weaponContext) {
+			return "weapon"
+		}
+		return "spacecraft"
+	},
+	"missile": func(map[string]bool) string { return "weapon" },
+	"plane": func(ctx map[string]bool) string { // also a flat quad: "PuddlePlane", "Ground_Plane"
+		if anyIn(ctx, airContext) {
+			return "aircraft"
+		}
+		return ""
+	},
+}
+
+// partMarkers name a piece of a character when the name or folder is about
+// characters ("SM_Chr_Attach_..."); they lose to any concrete noun.
+var partMarkers = set("attach", "attachment", "attachments", "accessory", "accessories", "head", "heads",
+	"torso", "arm", "arms", "leg", "legs", "hand", "hands", "face", "eyes", "body", "bodypart", "parts")
+
+// nameCodes are the asset-kind abbreviations of common library naming
+// conventions ("SM_Veh_...", "SK_Chr_..."), used when no noun decides.
+var nameCodes = map[string]string{"chr": "character", "veh": "vehicle", "wep": "weapon", "bld": "building"}
+
+func set(ws ...string) map[string]bool {
+	m := make(map[string]bool, len(ws))
+	for _, w := range ws {
+		m[w] = true
+	}
+	return m
+}
+
+func anyIn(ctx, words map[string]bool) bool {
+	for w := range words {
+		if ctx[w] {
+			return true
+		}
+	}
+	return false
+}
+
+// spaceCtx is explicit outer-space vocabulary; sci-fi alone is not enough
+// (sci-fi kits are full of cars and tanks), except for ships.
+func spaceCtx(ctx map[string]bool) bool { return anyIn(ctx, spaceContext) }
+
+func scifiCtx(ctx map[string]bool) bool {
+	return ctx["scifi"] || ctx["futuristic"] || ctx["sci"] && ctx["fi"]
+}
+
+// wordCategory maps one word to a category, consulting the context for
+// ambiguous words.
+func wordCategory(w string, ctx map[string]bool) string {
+	w = lookup(w)
+	if f, ok := contextual[w]; ok {
+		return f(ctx)
+	}
+	return categoryKeywords[w]
+}
+
+// inferCategory picks a category from, in order of trust: two-word phrases
+// in the file name, file-name nouns (separator segments left to right, as
+// library names go general to specific, but within a CamelCase segment the
+// last word first, as in "WallLantern"), character-part markers and
+// naming-convention codes, folder names from the import root down, and
+// finally mesh and material names.
+func inferCategory(path string, dirs, inner []string) string {
+	file := segments(path)
+	ctx := map[string]bool{}
+	var flat []string
+	for _, seg := range file {
+		for _, w := range seg {
+			ctx[w] = true
+			flat = append(flat, w)
+		}
+	}
+	for _, d := range dirs {
+		for _, w := range tokenize(d) {
+			ctx[w] = true
+		}
+	}
+	if c := vehicleRefine(phraseCategory(flat), ctx); c != "" {
+		return c
+	}
+	for _, seg := range file {
+		for i := len(seg) - 1; i >= 0; i-- {
+			if c := wordCategory(seg[i], ctx); c != "" {
+				return vehicleRefine(c, ctx)
+			}
+		}
+	}
+	charCtx := anyIn(ctx, characterContext)
+	for _, w := range flat {
+		if charCtx && partMarkers[w] {
+			return "character-part"
+		}
+	}
+	for _, w := range flat {
+		if c, ok := nameCodes[w]; ok {
+			return vehicleRefine(c, ctx)
+		}
+	}
+	if charCtx {
+		for _, d := range dirs {
+			for _, w := range tokenize(d) {
+				if partMarkers[w] {
+					return "character-part"
+				}
+			}
+		}
+	}
+	for _, d := range dirs {
+		segs := segments(d)
+		var words []string
+		for _, seg := range segs {
+			words = append(words, seg...)
+		}
+		if c := phraseCategory(words); c != "" {
+			return c
+		}
+		for _, seg := range segs {
+			for j := len(seg) - 1; j >= 0; j-- {
+				if c := wordCategory(seg[j], ctx); c != "" {
+					return vehicleRefine(c, ctx)
+				}
+			}
+		}
+	}
+	for _, n := range inner {
+		for _, w := range tokenize(n) {
+			if c := wordCategory(w, ctx); c != "" {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+func phraseCategory(words []string) string {
+	for i := 0; i+1 < len(words); i++ {
+		if c, ok := phrases[[2]string{lookup(words[i]), lookup(words[i+1])}]; ok {
+			return c
+		}
+	}
+	return ""
+}
+
+// vehicleRefine turns a generic "vehicle" into a space or water craft when
+// the context says so ("SM_Veh_Fighter" in a space kit).
+func vehicleRefine(c string, ctx map[string]bool) string {
+	if c == "vehicle" && spaceCtx(ctx) && !anyIn(ctx, set("car", "truck", "van", "bus", "bike", "motorcycle", "train", "tram")) {
+		return "spacecraft"
+	}
+	return c
 }
 
 // CategoryVocabulary returns each canonical category with the keywords that
