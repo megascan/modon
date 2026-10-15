@@ -15,14 +15,14 @@ import (
 
 func cmdUnclassified(args []string) error {
 	fs := flag.NewFlagSet("unclassified", flag.ContinueOnError)
-	limit := fs.Int("limit", 20, "")
-	offset := fs.Int("offset", 0, "")
+	limit := fs.Int("limit", 20, "assets per page")
+	offset := fs.Int("offset", 0, "skip this many (paging without claims)")
 	worker := fs.String("worker", "", "claim the batch for this worker id")
 	lease := fs.Duration("lease", store.DefaultLease, "claim duration")
 	onePer := fs.Bool("one-per-cluster", false, "one representative per duplicate cluster")
 	release := fs.Bool("release", false, "release the worker's claims")
-	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	asJSON := fs.Bool("json", false, "JSON output (also for --release)")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	d, err := openDeps()
@@ -35,7 +35,11 @@ func cmdUnclassified(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("released %d claim(s) of %s\n", n, *worker)
+		if *asJSON {
+			printJSON(map[string]any{"worker": *worker, "released": n})
+		} else {
+			fmt.Printf("released %d claim(s) of %s\n", n, *worker)
+		}
 		return nil
 	}
 	page, err := d.St.ListUnclassified(store.UnclassifiedOptions{
@@ -86,7 +90,7 @@ func cmdUpdate(args []string) error {
 	rev := fs.Bool("reviewed", false, "")
 	unrev := fs.Bool("unreviewed", false, "")
 	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {

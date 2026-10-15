@@ -45,6 +45,9 @@ func main() {
 		return
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if printPlainUsage(cmd, args) {
+		return
+	}
 	var err error
 	switch cmd {
 	case "serve":
@@ -92,6 +95,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
 		usage()
 		os.Exit(2)
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return // help was asked for and printed: not a failure
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -162,7 +168,7 @@ Embed-server flags:
 
 Unclassified flags (bulk tagging):
   --limit N --offset N --worker ID --lease 15m --one-per-cluster --json
-  --release (with --worker: drop that worker's remaining claims)
+  --release (with --worker: drop that worker's remaining claims; --json too)
 Update flags:
   --description D --category C --style S --type T
   --tags a,b --tags-mode merge|replace --remove-tags x,y
@@ -206,7 +212,7 @@ func cmdSetup(args []string) error {
 	noRec := fs.Bool("no-recursive", false, "do not recurse")
 	previews := fs.Bool("previews", false, "render thumbnails")
 	maxPrev := fs.Int("max-previews", 0, "cap thumbnails")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -272,7 +278,7 @@ func cmdImport(args []string) error {
 	noRec := fs.Bool("no-recursive", false, "do not recurse")
 	previews := fs.Bool("previews", false, "render thumbnails")
 	maxPrev := fs.Int("max-previews", 0, "cap thumbnails")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -318,7 +324,7 @@ func cmdSearch(args []string) error {
 	styleRef := fs.String("style-ref", "", "")
 	styleWeight := fs.Float64("style-weight", 0, "")
 	expand := fs.Bool("expand", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	q := model.Query{
@@ -440,7 +446,7 @@ func cmdDetails(args []string) error {
 func cmdPreview(args []string) error {
 	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
 	out := fs.String("out", "", "write image to this path (default: print cached path)")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -470,7 +476,7 @@ func cmdDownload(args []string) error {
 	fs := flag.NewFlagSet("download", flag.ContinueOnError)
 	dest := fs.String("dest", "", "")
 	mode := fs.String("mode", "copy", "copy|symlink|reference")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -752,7 +758,7 @@ func cmdEmbed(args []string) error {
 	apply := fs.Bool("apply", false, "with --classify: write the guesses (default: dry run)")
 	margin := fs.Float64("margin", 0, "with --classify: confidence margin")
 	eval := fs.Bool("eval", false, "report zero-shot accuracy against importer categories")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	d, err := openDeps()
@@ -812,7 +818,7 @@ func cmdEmbedServer(args []string) error {
 	textOnly := fs.Bool("text-only", false, "skip the vision encoder")
 	idle := fs.Int("idle-offload", -2, "seconds idle before leaving the GPU (0 = never)")
 	detach := fs.Bool("detach", false, "start in the background and return")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -883,7 +889,7 @@ func cmdSimilar(args []string) error {
 	style := fs.String("style", "", "")
 	limit := fs.Int("limit", 12, "")
 	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
