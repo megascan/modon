@@ -312,3 +312,53 @@ func TestMigrateFromV1(t *testing.T) {
 		t.Fatalf("after reopen: %v", res)
 	}
 }
+
+func TestSetHeuristicsRespectsProvenance(t *testing.T) {
+	st := openTest(t)
+	id, err := st.Upsert(model.Asset{PrimaryFile: "/lib/SK_Chr_Hair_01.fbx", Title: "SK Chr Hair 01",
+		Category: "character", Style: "lowpoly", Tags: []string{"character", "fbx"}, NeedsReview: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Heuristics{Category: "character-part", Style: "lowpoly", AssetType: "model", Tags: []string{"character-part", "character", "fbx"}}
+	if changed, err := st.SetHeuristics(id, h); err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	a, _ := st.GetByID(id)
+	if a.Category != "character-part" || len(a.Tags) != 3 || !a.NeedsReview {
+		t.Fatalf("heuristic refresh: %+v", a)
+	}
+	if changed, _ := st.SetHeuristics(id, h); changed {
+		t.Fatal("an identical refresh must report no change")
+	}
+
+	// Agent fields are never overwritten; an empty heuristic keeps the value.
+	if _, err := st.UpdateMetadata(id, MetadataUpdate{Category: "hair", Tags: []string{"ponytail"}, TagsMode: TagsReplace}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetHeuristics(id, Heuristics{Category: "character", Style: "", AssetType: "model", Tags: []string{"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ = st.GetByID(id)
+	if a.Category != "hair" || a.Style != "lowpoly" || len(a.Tags) != 1 || a.Tags[0] != "ponytail" {
+		t.Fatalf("agent values must survive: %+v", a)
+	}
+
+	// A zero-shot value is replaced by a real heuristic value only.
+	id2, _ := st.Upsert(model.Asset{PrimaryFile: "/lib/blob.fbx", Title: "blob"})
+	if err := st.SetClassification(id2, "rock", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetHeuristics(id2, Heuristics{AssetType: "model"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := st.GetByID(id2); a.Category != "rock" || a.Provenance["category"] != model.ProvenanceAuto {
+		t.Fatalf("auto value without a heuristic replacement: %+v", a)
+	}
+	if _, err := st.SetHeuristics(id2, Heuristics{Category: "creature", AssetType: "model"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := st.GetByID(id2); a.Category != "creature" || a.Provenance["category"] != "" {
+		t.Fatalf("auto value replaced by a heuristic: %+v", a)
+	}
+}

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"strings"
+	"time"
 
+	importdir "modon/internal/importer"
 	"modon/internal/semantic"
 	"modon/internal/server"
 	"modon/internal/store"
@@ -15,14 +21,16 @@ import (
 
 func cmdUnclassified(args []string) error {
 	fs := flag.NewFlagSet("unclassified", flag.ContinueOnError)
-	limit := fs.Int("limit", 20, "")
-	offset := fs.Int("offset", 0, "")
+	limit := fs.Int("limit", 20, "assets per page")
+	offset := fs.Int("offset", 0, "skip this many (paging without claims)")
 	worker := fs.String("worker", "", "claim the batch for this worker id")
 	lease := fs.Duration("lease", store.DefaultLease, "claim duration")
 	onePer := fs.Bool("one-per-cluster", false, "one representative per duplicate cluster")
 	release := fs.Bool("release", false, "release the worker's claims")
-	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	asJSON := fs.Bool("json", false, "JSON output (also for --release)")
+	withSuggest := fs.Bool("with-suggest", false, "inline ranked category/style/tag candidates per asset (implies --json)")
+	suggestTop := fs.Int("suggest-top", 3, "candidates per list with --with-suggest")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	d, err := openDeps()
@@ -35,7 +43,11 @@ func cmdUnclassified(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("released %d claim(s) of %s\n", n, *worker)
+		if *asJSON {
+			printJSON(map[string]any{"worker": *worker, "released": n})
+		} else {
+			fmt.Printf("released %d claim(s) of %s\n", n, *worker)
+		}
 		return nil
 	}
 	page, err := d.St.ListUnclassified(store.UnclassifiedOptions{
@@ -43,6 +55,20 @@ func cmdUnclassified(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if *withSuggest {
+		startSidecar(d, 0)
+		items, err := server.WithSuggestions(context.Background(), d, page.Assets, *suggestTop)
+		out := map[string]any{"count": len(items), "assets": items, "remaining": page.Remaining}
+		if page.Worker != "" {
+			out["worker"], out["lease_expires_at"] = page.Worker, page.LeaseExpiresAt
+		}
+		if err != nil {
+			// The batch is claimed already: hand it out without them.
+			out["suggest_error"] = err.Error()
+		}
+		printJSON(out)
+		return nil
 	}
 	if *asJSON {
 		printJSON(page)
@@ -75,22 +101,29 @@ func splitList(s string) []string {
 
 func cmdUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	desc := fs.String("description", "", "")
-	category := fs.String("category", "", "")
-	style := fs.String("style", "", "")
-	atype := fs.String("type", "", "")
-	tags := fs.String("tags", "", "comma-separated")
-	mode := fs.String("tags-mode", "", "merge | replace")
-	remove := fs.String("remove-tags", "", "comma-separated")
+	desc := fs.String("description", "", "description (agent-written)")
+	category := fs.String("category", "", "canonical category")
+	style := fs.String("style", "", "art-style descriptors")
+	atype := fs.String("type", "", "model | animation | material | texture | other")
+	tags := fs.String("tags", "", "comma-separated tags")
+	mode := fs.String("tags-mode", "", "merge (default) | replace")
+	remove := fs.String("remove-tags", "", "comma-separated tags to delete")
 	dups := fs.Bool("duplicates", false, "also edit every copy in the duplicate cluster")
-	rev := fs.Bool("reviewed", false, "")
-	unrev := fs.Bool("unreviewed", false, "")
-	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	rev := fs.Bool("reviewed", false, "force needs_review off")
+	unrev := fs.Bool("unreviewed", false, "force needs_review on")
+	batch := fs.String("batch", "", "JSON Lines file of edits (- = stdin); one re-embed pass at the end")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	if *batch != "" {
+		if fs.NArg() > 0 {
+			return fmt.Errorf("--batch takes its ids from the file; drop the positional ids")
+		}
+		return updateBatch(*batch, *asJSON)
+	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: modon update [flags] local:<id> [local:<id>...]")
+		return fmt.Errorf("usage: modon update [flags] local:<id> [local:<id>...] | modon update --batch edits.jsonl")
 	}
 	u := store.MetadataUpdate{
 		Description: *desc, Category: *category, Style: *style, AssetType: *atype,
@@ -116,6 +149,80 @@ func cmdUpdate(args []string) error {
 	return err
 }
 
+// readBatch parses JSON Lines edits (blank lines and # comments skipped).
+// A JSON array of edits is accepted too.
+func readBatch(r io.Reader) ([]server.UpdateItem, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if t := bytes.TrimSpace(data); len(t) > 0 && t[0] == '[' {
+		var items []server.UpdateItem
+		if err := json.Unmarshal(t, &items); err != nil {
+			return nil, fmt.Errorf("batch array: %w", err)
+		}
+		return items, nil
+	}
+	var items []server.UpdateItem
+	for n, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		var it server.UpdateItem
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.DisallowUnknownFields() // a typo like "tag" must not silently do nothing
+		if err := dec.Decode(&it); err != nil {
+			return nil, fmt.Errorf("batch line %d: %w", n+1, err)
+		}
+		items = append(items, it)
+	}
+	return items, nil
+}
+
+func updateBatch(path string, asJSON bool) error {
+	var r io.Reader = os.Stdin
+	if path != "-" {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		r = f
+	}
+	items, err := readBatch(r)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return fmt.Errorf("the batch has no edits")
+	}
+	d, err := openDeps()
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	res := server.ApplyBatch(context.Background(), d, items)
+	if asJSON {
+		printJSON(res)
+	} else {
+		fmt.Printf("%d edit(s), %d asset(s) updated", res.Items, res.Updated)
+		if e := res.Embedding; e != nil {
+			fmt.Printf(", %d text vector(s) re-embedded", e.Text)
+		} else {
+			fmt.Print(", embedding server unavailable (vectors refresh on the next embed)")
+		}
+		fmt.Println()
+		for _, e := range res.Errors {
+			fmt.Printf("error: item %d %s: %s\n", e.Item, e.ID, e.Error)
+		}
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("%d of %d edit(s) failed", len(res.Errors), res.Items)
+	}
+	return nil
+}
+
 func cmdDedupe(_ []string) error {
 	d, err := openDeps()
 	if err != nil {
@@ -132,5 +239,46 @@ func cmdDedupe(_ []string) error {
 		return err
 	}
 	printJSON(ds)
+	return nil
+}
+
+func cmdReclassify(args []string) error {
+	fs := flag.NewFlagSet("reclassify", flag.ContinueOnError)
+	apply := fs.Bool("apply", false, "write the changes (default: dry run)")
+	limit := fs.Int("limit", 0, "consider only the first N assets (0 = all)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	d, err := openDeps()
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	last := time.Time{}
+	s, err := importdir.Reclassify(context.Background(), d.St, importdir.ReclassifyOptions{
+		Apply: *apply, Limit: *limit,
+		Progress: func(done, total int) {
+			if done == total || time.Since(last) > 5*time.Second {
+				last = time.Now()
+				fmt.Fprintf(os.Stderr, "reclassify %d/%d\n", done, total)
+			}
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(s)
+	} else {
+		fmt.Printf("%d asset(s) considered, %d with changed heuristics, %d category change(s); %d agent categories kept; %d unreadable (stored metadata used)\n",
+			s.Considered, s.Changed, s.CategoryMoves, s.AgentProtected, s.Unreadable)
+		for _, k := range s.SortedChanges() {
+			fmt.Printf("  %5d  %s  e.g. %s\n", s.Changes[k], k, strings.Join(s.Examples[k], "; "))
+		}
+	}
+	if !*apply && s.Changed > 0 {
+		fmt.Fprintln(os.Stderr, "dry run: add --apply to write these changes (agent-written fields are never touched)")
+	}
 	return nil
 }

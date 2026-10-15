@@ -29,6 +29,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"modon/internal/classify"
 	"modon/internal/config"
 	"modon/internal/embed"
 	importdir "modon/internal/importer"
@@ -45,6 +46,9 @@ func main() {
 		return
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if printPlainUsage(cmd, args) {
+		return
+	}
 	var err error
 	switch cmd {
 	case "serve":
@@ -74,6 +78,8 @@ func main() {
 		err = cmdUpdate(args)
 	case "dedupe":
 		err = cmdDedupe(args)
+	case "reclassify":
+		err = cmdReclassify(args)
 	case "similar":
 		err = cmdSimilar(args)
 	case "suggest":
@@ -92,6 +98,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
 		usage()
 		os.Exit(2)
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return // help was asked for and printed: not a failure
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -115,10 +124,11 @@ Usage:
   modon service install|uninstall|status|print
                                 Keep the embedding server up as a systemd user unit
   modon similar [flags] <id>    Owned assets that look like <id> (local or remote)
-  modon suggest <id>            Zero-shot category/style guesses for a local asset
+  modon suggest [flags] <id>... Ranked category/style/tag candidates for local assets
   modon unclassified [flags]    Review queue: page, claim batches for a worker
   modon update [flags] <id>...  Write agent metadata (tags merge/replace/remove)
   modon dedupe                  Recompute duplicate clusters (FBX/OBJ copies, shared props)
+  modon reclassify [--apply]    Re-run import heuristics on indexed assets (never agent edits)
   modon config [get|set|path]   Inspect or change configuration
   modon stats                   Local index statistics + config status
   modon help | version
@@ -162,12 +172,16 @@ Embed-server flags:
 
 Unclassified flags (bulk tagging):
   --limit N --offset N --worker ID --lease 15m --one-per-cluster --json
-  --release (with --worker: drop that worker's remaining claims)
+  --with-suggest [--suggest-top N] (inline suggest candidates; implies --json)
+  --release (with --worker: drop that worker's remaining claims; --json too)
 Update flags:
   --description D --category C --style S --type T
   --tags a,b --tags-mode merge|replace --remove-tags x,y
   --duplicates (also edit every copy in each asset's duplicate cluster)
   --reviewed / --unreviewed (force the review flag)
+  --batch FILE|- (JSON Lines edits, one per line, re-embedded once at the end)
+Suggest flags:
+  --top N (candidates per list, default 3)   --vocabulary (print the tag vocabulary)
 
 Examples:
   modon setup --previews ~/Assets/Models
@@ -206,7 +220,7 @@ func cmdSetup(args []string) error {
 	noRec := fs.Bool("no-recursive", false, "do not recurse")
 	previews := fs.Bool("previews", false, "render thumbnails")
 	maxPrev := fs.Int("max-previews", 0, "cap thumbnails")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -272,7 +286,7 @@ func cmdImport(args []string) error {
 	noRec := fs.Bool("no-recursive", false, "do not recurse")
 	previews := fs.Bool("previews", false, "render thumbnails")
 	maxPrev := fs.Int("max-previews", 0, "cap thumbnails")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -318,7 +332,7 @@ func cmdSearch(args []string) error {
 	styleRef := fs.String("style-ref", "", "")
 	styleWeight := fs.Float64("style-weight", 0, "")
 	expand := fs.Bool("expand", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	q := model.Query{
@@ -440,7 +454,7 @@ func cmdDetails(args []string) error {
 func cmdPreview(args []string) error {
 	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
 	out := fs.String("out", "", "write image to this path (default: print cached path)")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -470,7 +484,7 @@ func cmdDownload(args []string) error {
 	fs := flag.NewFlagSet("download", flag.ContinueOnError)
 	dest := fs.String("dest", "", "")
 	mode := fs.String("mode", "copy", "copy|symlink|reference")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -752,7 +766,7 @@ func cmdEmbed(args []string) error {
 	apply := fs.Bool("apply", false, "with --classify: write the guesses (default: dry run)")
 	margin := fs.Float64("margin", 0, "with --classify: confidence margin")
 	eval := fs.Bool("eval", false, "report zero-shot accuracy against importer categories")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	d, err := openDeps()
@@ -812,7 +826,7 @@ func cmdEmbedServer(args []string) error {
 	textOnly := fs.Bool("text-only", false, "skip the vision encoder")
 	idle := fs.Int("idle-offload", -2, "seconds idle before leaving the GPU (0 = never)")
 	detach := fs.Bool("detach", false, "start in the background and return")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -883,7 +897,7 @@ func cmdSimilar(args []string) error {
 	style := fs.String("style", "", "")
 	limit := fs.Int("limit", 12, "")
 	asJSON := fs.Bool("json", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -920,12 +934,26 @@ func cmdSimilar(args []string) error {
 }
 
 func cmdSuggest(args []string) error {
-	if len(args) < 1 || !strings.HasPrefix(args[0], "local:") {
-		return fmt.Errorf("usage: modon suggest local:<id>")
-	}
-	id, err := strconv.ParseInt(strings.TrimPrefix(args[0], "local:"), 10, 64)
-	if err != nil {
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	topK := fs.Int("top", 3, "candidates per list (neighbor tags get 4x)")
+	vocab := fs.Bool("vocabulary", false, "print the recommended tag vocabulary and exit")
+	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if *vocab {
+		printJSON(classify.TagVocabulary)
+		return nil
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: modon suggest [--top N] local:<id> [local:<id>...] | modon suggest --vocabulary")
+	}
+	ids := make([]int64, fs.NArg())
+	for i, ref := range fs.Args() {
+		id, err := server.LocalID(ref)
+		if err != nil {
+			return fmt.Errorf("suggestions are for local assets: %w", err)
+		}
+		ids[i] = id
 	}
 	d, err := openDeps()
 	if err != nil {
@@ -933,11 +961,18 @@ func cmdSuggest(args []string) error {
 	}
 	defer d.Close()
 	startSidecar(d, 0)
-	sg, err := d.Sem.Suggest(context.Background(), id)
+	sgs, err := d.Sem.SuggestMany(context.Background(), ids, *topK)
 	if err != nil {
 		return err
 	}
-	printJSON(sg)
+	if len(sgs) == 1 {
+		if sgs[0].Error != "" {
+			return errors.New(sgs[0].Error)
+		}
+		printJSON(sgs[0])
+		return nil
+	}
+	printJSON(sgs)
 	return nil
 }
 

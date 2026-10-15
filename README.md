@@ -44,14 +44,14 @@ preserved across re-imports).
 |---|---|
 | `search_assets` | Free-text + tags/category/style/type/animated/free/max-price/source/limit search, or `image` (query by picture), plus `style_reference` (image or asset id) to keep a consistent look. Owned (`local`) results come first, hybrid-ranked when semantic search is on (`score`, `matched_by`); paid hits carry `purchase_required: true`. |
 | `find_similar` | Owned assets that look like / are described like `local:` (variants, duplicates) or a remote `polypizza:`/`fab:` result (*"you already own one like this"* before buying). |
-| `suggest_metadata` | Zero-shot category + art-style guesses (with confidence margin) from a local asset's preview and text. |
+| `suggest_metadata` | Ranked category, art-style and vocabulary-tag candidates from a local asset's preview and text, plus tags agents wrote on its look-alikes (`ids` for a batch). |
 | `embed_index` | Build/refresh vectors (incremental), optionally render missing previews and auto-fill empty categories. |
 | `get_asset_details` | Full details for `local:<rowid>`, `polypizza:<id>` or `fab:<uid>`. |
 | `get_preview` | Preview image inline (plus cached path). Local assets render on demand via Blender/f3d. |
 | `download_asset` | `copy` (default) / `symlink` / `reference` for local; downloads remote free files. Paid/unclaimed Fab assets return `purchase_required` / `claim_required` with price + listing URL instead of files. |
 | `import_assets` | The setup command as a tool: import + classify a directory, optional thumbnails. |
-| `update_asset_metadata` | Enrich a local asset (description, category, style, type, tags). Clears `needs_review`. |
-| `list_unclassified` | Local assets still needing rich descriptions, largest first. |
+| `update_asset_metadata` | Enrich local assets (description, category, style, type, tags); `items` writes a whole batch with one re-embed. Clears `needs_review`. |
+| `list_unclassified` | Local assets still needing rich descriptions, largest first; claims for parallel agents, `with_suggestions` inlines candidates. |
 | `index_stats` | Index totals/breakdowns, semantic status (vectors, server) + which sources/credentials are configured. |
 
 Typical agent loop: `search_assets` → `get_preview` → `find_similar` on
@@ -126,7 +126,9 @@ modon download <id> [--dest d] [--mode copy|symlink|reference]
 modon embed [flags]            build/refresh semantic vectors (incremental)
 modon embed-server [flags]     run the EmbeddingGemma 2 sidecar (needs uv)
 modon similar [flags] <id>     owned assets that look like <id>
-modon suggest local:<id>       zero-shot category/style guesses
+modon suggest local:<id>...    ranked category/style/tag candidates
+modon unclassified / update    bulk tagging (docs/service-and-bulk-tagging.md)
+modon reclassify [--apply]     re-run import heuristics (agent edits kept)
 modon config [get|set|path]    inspect/change config (secrets masked)
 modon stats                    index stats + config status
 ```

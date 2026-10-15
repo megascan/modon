@@ -25,7 +25,7 @@ func cmdService(args []string) error {
 	fs := flag.NewFlagSet("service", flag.ContinueOnError)
 	noEnable := fs.Bool("no-enable", false, "write the unit but do not enable/start it")
 	replace := fs.Bool("replace", false, "stop a running ad-hoc embed-server first")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := parseFlags(fs, args[1:]); err != nil {
 		return err
 	}
 	switch args[0] {

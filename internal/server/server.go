@@ -106,8 +106,8 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "suggest_metadata",
-		Description: "Zero-shot category and art-style guesses for a local asset from its preview image and text, with scores and a confidence margin. Use while enriching list_unclassified results, then write the result with update_asset_metadata. Needs semantic search.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in IDInput) (*mcp.CallToolResult, any, error) {
+		Description: "Ranked metadata candidates for local assets, to tag deeper than the file name: zero-shot categories, art styles and tags from the recommended vocabulary (material, theme, condition, use, kitbash role; each with its facet) matched against the preview image and text, with scores and a category confidence margin; plus neighbor_tags and neighbor_categories, what agents already wrote on the most similar agent-tagged assets (score = similarity-weighted share, count = how many of the neighbors). Treat them as candidates to confirm against the preview, then write with update_asset_metadata. Pass ids for several assets at once (list_unclassified with_suggestions inlines them). Needs semantic search.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in SuggestInput) (*mcp.CallToolResult, any, error) {
 		return handleSuggest(ctx, d, in)
 	})
 
@@ -148,14 +148,14 @@ func NewMCPServer(d *Deps) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "update_asset_metadata",
-		Description: "Write metadata for local assets: description, category, art-style descriptors, tags, asset type. Fields you write are recorded as agent-written (provenance) and survive re-imports; heuristic values never overwrite them. Tags merge by default; tags_mode=replace makes tags the complete list, remove_tags deletes tags. Pass ids to tag several assets at once and apply_to_duplicates to copy the edit to every copy in the asset's duplicate cluster. needs_review clears once a description exists, or a category plus tags; this also releases any list_unclassified claim on the asset.",
+		Description: "Write metadata for local assets: description, category, art-style descriptors, tags, asset type. Fields you write are recorded as agent-written (provenance) and survive re-imports; heuristic values never overwrite them. Tags merge by default; tags_mode=replace makes tags the complete list, remove_tags deletes tags. Pass ids to tag several assets at once and apply_to_duplicates to copy the edit to every copy in the asset's duplicate cluster. For bulk tagging pass items: a list of independent edits (each with its own id and fields) written in one call and re-embedded together, much faster than one call per asset. needs_review clears once a description exists, or a category plus tags; this also releases any list_unclassified claim on the asset.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in UpdateMetadataInput) (*mcp.CallToolResult, any, error) {
 		return handleUpdateMetadata(ctx, d, in)
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_unclassified",
-		Description: "List local assets that still need review, largest files first. Page with offset. For parallel tagging, pass worker (any id unique to you): the returned assets are claimed for you for lease_seconds (default 900) and other workers get disjoint batches; claims are released as you update each asset, and release=true drops your remaining claims. one_per_cluster returns one representative per duplicate cluster (its duplicates are listed and claimed too) so you can tag it once with apply_to_duplicates.",
+		Description: "List local assets that still need review, largest files first. Page with offset. For parallel tagging, pass worker (any id unique to you): the returned assets are claimed for you for lease_seconds (default 900) and other workers get disjoint batches; claims are released as you update each asset, and release=true drops your remaining claims. one_per_cluster returns one representative per duplicate cluster (its duplicates are listed and claimed too) so you can tag it once with apply_to_duplicates. with_suggestions inlines suggest_metadata candidates for every asset (one call per batch); write the batch back with update_asset_metadata items.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
 		return handleUnclassified(ctx, d, in)
 	})
@@ -227,7 +227,9 @@ type ImportInput struct {
 	MaxPreviews    int    `json:"max_previews,omitempty" jsonschema:"Cap on thumbnails rendered in one run, 0 means unlimited"`
 }
 
-type UpdateMetadataInput struct {
+// UpdateItem is one metadata edit: the update_asset_metadata arguments and
+// one line of `modon update --batch`.
+type UpdateItem struct {
 	ID                string   `json:"id,omitempty" jsonschema:"Local asset id: local:<rowid>"`
 	IDs               []string `json:"ids,omitempty" jsonschema:"Several local asset ids that get the same edit (instead of id)"`
 	Description       string   `json:"description,omitempty" jsonschema:"Rich description of the asset"`
@@ -241,6 +243,26 @@ type UpdateMetadataInput struct {
 	Reviewed          *bool    `json:"reviewed,omitempty" jsonschema:"Force needs_review off (true) or on (false); by default it clears once a description, or a category plus tags, exists"`
 }
 
+func (it UpdateItem) refs() []string {
+	refs := it.IDs
+	if it.ID != "" {
+		refs = append([]string{it.ID}, refs...)
+	}
+	return refs
+}
+
+func (it UpdateItem) update() store.MetadataUpdate {
+	return store.MetadataUpdate{
+		Description: it.Description, Category: it.Category, Style: it.Style, AssetType: it.AssetType,
+		Tags: it.Tags, TagsMode: it.TagsMode, RemoveTags: it.RemoveTags, Reviewed: it.Reviewed,
+	}
+}
+
+type UpdateMetadataInput struct {
+	UpdateItem
+	Items []UpdateItem `json:"items,omitempty" jsonschema:"Batch mode: independent edits (each with its own id/ids and fields) applied together, with one re-embedding pass at the end instead of one per asset. Use it to write a whole tagging batch in one call."`
+}
+
 type UnclassifiedInput struct {
 	Limit         int    `json:"limit,omitempty" jsonschema:"Max rows to return, default 20"`
 	Offset        int    `json:"offset,omitempty" jsonschema:"Skip this many rows (paging without claims)"`
@@ -248,6 +270,15 @@ type UnclassifiedInput struct {
 	LeaseSeconds  int    `json:"lease_seconds,omitempty" jsonschema:"How long claims last, default 900"`
 	OnePerCluster bool   `json:"one_per_cluster,omitempty" jsonschema:"One representative per duplicate cluster; its duplicates are listed (and claimed with worker)"`
 	Release       bool   `json:"release,omitempty" jsonschema:"With worker: release your remaining claims instead of listing"`
+
+	WithSuggestions bool `json:"with_suggestions,omitempty" jsonschema:"Inline suggest_metadata candidates (categories, styles, vocabulary tags, neighbor tags) for each asset; needs semantic search"`
+	SuggestTop      int  `json:"suggest_top,omitempty" jsonschema:"Candidates per list with with_suggestions, default 3"`
+}
+
+type SuggestInput struct {
+	ID   string   `json:"id,omitempty" jsonschema:"Local asset id: local:<rowid>"`
+	IDs  []string `json:"ids,omitempty" jsonschema:"Several local asset ids (instead of id)"`
+	TopK int      `json:"top_k,omitempty" jsonschema:"Candidates per list, default 3 (neighbor tags get 4x)"`
 }
 
 type EmptyInput struct{}
@@ -426,24 +457,31 @@ func handleImport(ctx context.Context, d *Deps, in ImportInput) (*mcp.CallToolRe
 }
 
 func handleUpdateMetadata(ctx context.Context, d *Deps, in UpdateMetadataInput) (*mcp.CallToolResult, any, error) {
-	refs := in.IDs
-	if in.ID != "" {
-		refs = append([]string{in.ID}, refs...)
-	}
-	if len(refs) == 0 {
-		return errResult(fmt.Errorf("id (or ids) is required, e.g. local:3")), nil, nil
-	}
-	u := store.MetadataUpdate{
-		Description: in.Description, Category: in.Category, Style: in.Style, AssetType: in.AssetType,
-		Tags: in.Tags, TagsMode: in.TagsMode, RemoveTags: in.RemoveTags, Reviewed: in.Reviewed,
-	}
-	updated, err := UpdateMetadata(ctx, d, refs, u, in.ApplyToDuplicates)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	var payload any = map[string]any{"updated": len(updated), "assets": updated}
-	if len(updated) == 1 {
-		payload = updated[0] // single edits keep the original response shape
+	var payload any
+	if len(in.Items) > 0 {
+		items := in.Items
+		if len(in.refs()) > 0 {
+			items = append([]UpdateItem{in.UpdateItem}, items...)
+		}
+		res := ApplyBatch(ctx, d, items)
+		payload = res
+		if res.Updated == 0 && len(res.Errors) > 0 {
+			text, _ := json.MarshalIndent(res, "", "  ")
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(text)}}, IsError: true}, nil, nil
+		}
+	} else {
+		refs := in.refs()
+		if len(refs) == 0 {
+			return errResult(fmt.Errorf("id (or ids, or items) is required, e.g. local:3")), nil, nil
+		}
+		updated, err := UpdateMetadata(ctx, d, refs, in.update(), in.ApplyToDuplicates)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		payload = map[string]any{"updated": len(updated), "assets": updated}
+		if len(updated) == 1 {
+			payload = updated[0] // single edits keep the original response shape
+		}
 	}
 	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
@@ -454,6 +492,19 @@ func handleUpdateMetadata(ctx context.Context, d *Deps, in UpdateMetadataInput) 
 // UpdateMetadata applies one agent edit to local assets (and, with
 // duplicates, to every copy in their clusters), then re-embeds them.
 func UpdateMetadata(ctx context.Context, d *Deps, refs []string, u store.MetadataUpdate, duplicates bool) ([]model.Asset, error) {
+	out, err := applyUpdate(d, refs, u, duplicates)
+	if len(out) > 0 {
+		ids := make([]int64, len(out))
+		for i, a := range out {
+			ids[i] = a.RowID
+		}
+		d.Sem.Refresh(ctx, ids...)
+	}
+	return out, err
+}
+
+// applyUpdate writes one edit without re-embedding.
+func applyUpdate(d *Deps, refs []string, u store.MetadataUpdate, duplicates bool) ([]model.Asset, error) {
 	if u.Empty() {
 		return nil, fmt.Errorf("nothing to update: pass description, category, style, asset_type, tags, remove_tags or reviewed")
 	}
@@ -493,8 +544,67 @@ func UpdateMetadata(ctx context.Context, d *Deps, refs []string, u store.Metadat
 		}
 		out = append(out, a)
 	}
-	d.Sem.Refresh(ctx, ids...)
 	return out, nil
+}
+
+// BatchAsset is the compact per-asset result of a batch edit.
+type BatchAsset struct {
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Category    string   `json:"category,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	NeedsReview bool     `json:"needs_review"`
+}
+
+// BatchError reports one failed edit; Item is its 0-based position.
+type BatchError struct {
+	Item  int    `json:"item"`
+	ID    string `json:"id,omitempty"`
+	Error string `json:"error"`
+}
+
+// BatchResult summarizes ApplyBatch.
+type BatchResult struct {
+	Items     int                     `json:"items"`
+	Updated   int                     `json:"updated"` // distinct assets written
+	Assets    []BatchAsset            `json:"assets"`
+	Errors    []BatchError            `json:"errors,omitempty"`
+	Embedding *semantic.BackfillStats `json:"embedding,omitempty"`
+}
+
+// ApplyBatch applies independent edits in order and re-embeds every touched
+// asset once at the end, in batched embedding calls. A failing item is
+// reported and skipped; the others still apply.
+func ApplyBatch(ctx context.Context, d *Deps, items []UpdateItem) *BatchResult {
+	res := &BatchResult{Items: len(items), Assets: []BatchAsset{}}
+	pos := map[int64]int{}
+	var ids []int64
+	for i, it := range items {
+		refs := it.refs()
+		if len(refs) == 0 {
+			res.Errors = append(res.Errors, BatchError{Item: i, Error: "id or ids is required"})
+			continue
+		}
+		out, err := applyUpdate(d, refs, it.update(), it.ApplyToDuplicates)
+		if err != nil {
+			res.Errors = append(res.Errors, BatchError{Item: i, ID: strings.Join(refs, ","), Error: err.Error()})
+		}
+		for _, a := range out {
+			ba := BatchAsset{ID: a.ID, Title: a.Title, Category: a.Category, Tags: a.Tags, NeedsReview: a.NeedsReview}
+			if p, ok := pos[a.RowID]; ok {
+				res.Assets[p] = ba // a later item edited it again
+				continue
+			}
+			pos[a.RowID] = len(res.Assets)
+			res.Assets = append(res.Assets, ba)
+			ids = append(ids, a.RowID)
+		}
+	}
+	res.Updated = len(ids)
+	if len(ids) > 0 {
+		res.Embedding = d.Sem.Refresh(ctx, ids...)
+	}
+	return res
 }
 
 // LocalID parses "local:<rowid>".
@@ -513,7 +623,7 @@ func LocalID(ref string) (int64, error) {
 	return id, nil
 }
 
-func handleUnclassified(_ context.Context, d *Deps, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
+func handleUnclassified(ctx context.Context, d *Deps, in UnclassifiedInput) (*mcp.CallToolResult, any, error) {
 	var payload any
 	if in.Release {
 		n, err := d.St.ReleaseClaims(in.Worker)
@@ -533,12 +643,48 @@ func handleUnclassified(_ context.Context, d *Deps, in UnclassifiedInput) (*mcp.
 		if page.Worker != "" {
 			m["worker"], m["lease_expires_at"] = page.Worker, page.LeaseExpiresAt
 		}
+		if in.WithSuggestions {
+			items, err := WithSuggestions(ctx, d, page.Assets, in.SuggestTop)
+			m["assets"] = items
+			if err != nil {
+				// The batch is claimed already: hand it out without them.
+				m["suggest_error"] = err.Error()
+			}
+		}
 		payload = m
 	}
 	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
 	}, payload, nil
+}
+
+// ReviewItem is a review-queue asset with its inlined suggestions.
+type ReviewItem struct {
+	model.Asset
+	Suggestions *semantic.Suggestions `json:"suggestions,omitempty"`
+}
+
+// WithSuggestions attaches suggestions to a review page. On error (no
+// embedding server) the assets come back without them.
+func WithSuggestions(ctx context.Context, d *Deps, assets []model.Asset, k int) ([]ReviewItem, error) {
+	items := make([]ReviewItem, len(assets))
+	ids := make([]int64, len(assets))
+	for i, a := range assets {
+		items[i].Asset = a
+		ids[i] = a.RowID
+	}
+	if len(ids) == 0 {
+		return items, nil
+	}
+	sgs, err := d.Sem.SuggestMany(ctx, ids, k)
+	if err != nil {
+		return items, err
+	}
+	for i := range items {
+		items[i].Suggestions = sgs[i]
+	}
+	return items, nil
 }
 
 func handleStats(ctx context.Context, d *Deps, _ EmptyInput) (*mcp.CallToolResult, any, error) {
@@ -619,26 +765,37 @@ func handleSimilar(ctx context.Context, d *Deps, in SimilarInput) (*mcp.CallTool
 	}, payload, nil
 }
 
-func handleSuggest(ctx context.Context, d *Deps, in IDInput) (*mcp.CallToolResult, any, error) {
-	src, rid, err := source.SplitID(in.ID)
+func handleSuggest(ctx context.Context, d *Deps, in SuggestInput) (*mcp.CallToolResult, any, error) {
+	refs := in.IDs
+	if in.ID != "" {
+		refs = append([]string{in.ID}, refs...)
+	}
+	if len(refs) == 0 {
+		return errResult(fmt.Errorf("id (or ids) is required, e.g. local:3")), nil, nil
+	}
+	ids := make([]int64, len(refs))
+	for i, ref := range refs {
+		id, err := LocalID(ref)
+		if err != nil {
+			return errResult(fmt.Errorf("suggestions are for local assets: %w", err)), nil, nil
+		}
+		ids[i] = id
+	}
+	sgs, err := d.Sem.SuggestMany(ctx, ids, in.TopK)
 	if err != nil {
 		return errResult(err), nil, nil
 	}
-	if src != model.SourceLocal {
-		return errResult(fmt.Errorf("suggestions are for local assets, got %q", in.ID)), nil, nil
+	var payload any = map[string]any{"count": len(sgs), "suggestions": sgs}
+	if len(sgs) == 1 {
+		if sgs[0].Error != "" {
+			return errResult(errors.New(sgs[0].Error)), nil, nil
+		}
+		payload = sgs[0] // one id keeps the original response shape
 	}
-	rowID, err := strconv.ParseInt(rid, 10, 64)
-	if err != nil {
-		return errResult(fmt.Errorf("local asset ids are numeric, got %q", in.ID)), nil, nil
-	}
-	sg, err := d.Sem.Suggest(ctx, rowID)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	text, _ := json.MarshalIndent(sg, "", "  ")
+	text, _ := json.MarshalIndent(payload, "", "  ")
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
-	}, sg, nil
+	}, payload, nil
 }
 
 func handleEmbed(ctx context.Context, d *Deps, in EmbedInput) (*mcp.CallToolResult, any, error) {
