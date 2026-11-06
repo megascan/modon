@@ -11,6 +11,7 @@
 # unsupported.
 import json
 import os
+import re
 import sys
 import traceback
 
@@ -61,9 +62,13 @@ NON_COLOR = ("normal", "_n", "emission", "emissive", "metal", "rough", "spec", "
              "mask", "height", "_disp", "opacity", "alpha", "gloss")
 
 
+_image_children = {}  # directory -> top-level subfolders holding images
+
+
 def index_dir(root):
     if root not in _dir_index:
         stems = {}
+        children = set()
         count = 0
         for dirpath, dirnames, files in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
@@ -72,10 +77,20 @@ def index_dir(root):
                 stem, ext = os.path.splitext(fn)
                 if ext.lower() in IMAGE_EXTS:
                     stems.setdefault(stem.lower(), []).append(os.path.join(dirpath, fn))
+                    rel = os.path.relpath(dirpath, root)
+                    children.add(rel.split(os.sep)[0] if rel != "." else ".")
             if count > 200000:  # do not crawl a whole drive
                 break
         _dir_index[root] = stems
+        _image_children[root] = children
     return _dir_index[root]
+
+
+def is_library(root):
+    """A folder whose images sit in three or more separate subfolders is a
+    collection of packs (e.g. ~/Assets/Synty), not one pack."""
+    index_dir(root)
+    return len(_image_children[root] - {"."}) >= 3
 
 
 def find_texture(stems, name):
@@ -92,6 +107,146 @@ def find_texture(stems, name):
         return None
     variants.sort(key=lambda s: (s != stem + "_a", len(s), s))
     return stems[variants[0]][0]
+
+
+# Fuzzy matching for packs whose FBX files name textures differently from
+# the files shipped (PolygonTown_Texture_01_A -> PolygonTown_01_A.png,
+# PolygonZombie_Texture_A -> PolygonZombie_Texture_01_A.png, an older pack
+# name like PolygonMilitary_ for PolygonBattleRoyale_, working-copy suffixes
+# like _GoodVersion or _Andrew).
+_TOKEN = re.compile(r"[^a-z0-9]+")
+_FILLER = {"texture", "textures", "tex", "01", "1", "001"}
+_PACK_PREFIXES = ("polygon", "simple", "synty")
+_NON_COLOR_PREFIXES = ("normal", "nrml", "emiss", "emmis", "emision", "metal", "rough", "spec", "gloss",
+                       "occlusion", "height", "disp", "opacity", "alpha", "mask")
+_NON_COLOR_WORDS = {"n", "ao"}
+_key_index = {}  # (root, drop_pack) -> {key: [stems]}
+
+
+def _tokens(stem):
+    return [t for t in _TOKEN.split(stem.lower()) if t]
+
+
+def _non_color(stem):
+    return any(t in _NON_COLOR_WORDS or t.startswith(_NON_COLOR_PREFIXES) for t in _tokens(stem))
+
+
+def _key(stem, drop_pack):
+    """Normalized name: no filler words, and a leading pack prefix glued to
+    the first word is removed (PolygonGeneric -> generic, SimpleCity ->
+    city). drop_pack drops that first word entirely (PolygonMilitary_ vs
+    PolygonBattleRoyale_ naming the same atlas)."""
+    toks = [t for t in _tokens(stem) if t not in _FILLER]
+    if toks and toks[0].startswith(_PACK_PREFIXES):
+        if drop_pack:
+            toks = toks[1:]
+        else:
+            rest = toks[0]
+            for p in _PACK_PREFIXES:
+                if rest.startswith(p):
+                    rest = rest[len(p):]
+                    break
+            toks = ([rest] if rest else []) + toks[1:]
+    return "_".join(toks)
+
+
+def _keys(root, drop_pack):
+    k = (root, drop_pack)
+    if k not in _key_index:
+        idx = {}
+        for s in index_dir(root):
+            if not _non_color(s):
+                idx.setdefault(_key(s, drop_pack), []).append(s)
+        _key_index[k] = idx
+    return _key_index[k]
+
+
+def _by_key(root, stem, drop_pack):
+    """Colour texture whose normalized name equals stem's, else its primary
+    variant (key + "_a" first)."""
+    want = _key(stem, drop_pack)
+    idx = _keys(root, drop_pack)
+    if not want:
+        # Only pack name + filler (Polygon_Texture_01): the pack's main atlas.
+        if not drop_pack:
+            return None
+        want = "a"
+    hits = idx.get(want)
+    if not hits:
+        variants = [k for k in idx if k.startswith(want + "_")]
+        if not variants and drop_pack and any(c.isdigit() for c in want):
+            # Same sheet number under another pack name: ..._Texture_02_A.
+            variants = [k for k in idx if k.endswith("_" + want)]
+        if not variants:
+            return None
+        variants.sort(key=lambda k: (not k.endswith("_a"), len(k), k))
+        hits = idx[variants[0]]
+    best = min(hits, key=lambda s: (len(s), s))
+    return index_dir(root)[best][0]
+
+
+def _singular(t):
+    return t[:-1] if len(t) > 4 and t.endswith("s") else t
+
+
+def _by_overlap(root, stem):
+    """Last resort: the colour texture sharing the most name words
+    (Land_Vehicle_Master_Destroyed_01 -> ..._Vehicles_01.png)."""
+    want = {_singular(t) for t in _key(stem, True).split("_") if len(t) >= 4 and not t.isdigit()}
+    if not want:
+        return None
+    best, best_rank = None, None
+    for s in index_dir(root):
+        if _non_color(s):
+            continue
+        have = {_singular(t) for t in _key(s, True).split("_") if t}
+        common = len(want & have)
+        if common == 0:
+            continue
+        rank = (-common, len(have - want), len(s), s)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = s, rank
+    return index_dir(root)[best][0] if best else None
+
+
+def locate_texture(roots, name):
+    """Resolve a referenced texture file name against the asset's folder and
+    its parents. Returns (path, guessed): exact and variant matches may use
+    every root; the fuzzy tiers (guessed=True) skip folders that hold several
+    packs, so they stay inside the asset's own pack."""
+    stem = os.path.splitext(name)[0].lower()
+    if not stem:
+        return None, False
+    for root in roots:
+        hit = find_texture(index_dir(root), name)
+        if hit:
+            return hit, False
+    if _non_color(stem):
+        return None, False  # a missing normal/emission map is dropped, never guessed
+    return _guess_texture([r for r in roots if not is_library(r)], roots, stem), True
+
+
+def _guess_texture(near, roots, stem):
+    toks = _tokens(stem)
+    # Drop trailing words one at a time: Texture_GoodVersion, rubble_02.
+    for n in range(len(toks), 0, -1):
+        part = "_".join(toks[:n])
+        if n < len(toks) and not _key(part, False):
+            break  # only filler words left
+        for root in roots if n < len(toks) else ():
+            hit = find_texture(index_dir(root), part)
+            if hit:
+                return hit
+        for drop_pack in (False, True):
+            for root in near:
+                hit = _by_key(root, part, drop_pack)
+                if hit:
+                    return hit
+    for root in near:
+        hit = _by_overlap(root, stem)
+        if hit:
+            return hit
+    return None
 
 
 def image_missing(img):
@@ -117,14 +272,12 @@ def resolve_textures(asset):
             break
         d = parent
     unresolved = 0
+    guessed = set()
     for img in missing:
         name = os.path.basename(bpy.path.abspath(img.filepath).replace("\\", "/")).lower()
-        hit = None
-        if name:
-            for root in roots:
-                hit = find_texture(index_dir(root), name)
-                if hit:
-                    break
+        hit, guess = locate_texture(roots, name) if name else (None, False)
+        if hit and guess:
+            guessed.add(img)
         if hit:
             img.filepath = hit
             try:
@@ -133,18 +286,70 @@ def resolve_textures(asset):
                 unresolved += 1
         else:
             unresolved += 1
+    if guessed:
+        unresolved += reject_tiling_guesses(guessed)
     return unresolved
+
+
+def reject_tiling_guesses(guessed):
+    """A guessed atlas is wrong for a material made for a tiling texture: it
+    would show the atlas sheet itself. Atlas-mapped meshes put every face on
+    a small swatch; tiling ones (floors, wall strips) have faces spanning
+    most of the texture in at least one direction. Such guesses are dropped
+    again (material colour). Returns how many."""
+    tiling = set()
+    for ob in bpy.data.objects:
+        me = ob.data if ob.type == "MESH" else None
+        if me is None or not me.uv_layers or not me.materials:
+            continue
+        uv = me.uv_layers.active.data
+        for poly in me.polygons:
+            if poly.material_index >= len(me.materials):
+                continue
+            mat = me.materials[poly.material_index]
+            if mat is None or mat in tiling:
+                continue
+            us = [uv[li].uv[0] for li in poly.loop_indices]
+            vs = [uv[li].uv[1] for li in poly.loop_indices]
+            du, dv = max(us) - min(us), max(vs) - min(vs)
+            if du > 0.6 or dv > 0.6:
+                tiling.add(mat)
+    dropped = set()
+    for mat in tiling:
+        if not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image in guessed:
+                dropped.add(node.image)
+                node.image = None
+    return len(dropped)
+
+
+def drop_missing_images():
+    """Detach image nodes whose file is still missing, so Workbench draws
+    those materials in their material colour rather than magenta while the
+    rest of the asset keeps its textures (one unresolved map, often just a
+    normal map, used to turn the whole thumbnail flat grey)."""
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or mat.node_tree is None:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is not None and image_missing(node.image):
+                node.image = None
 
 
 def render(out, size, asset=None):
     scene = bpy.context.scene
     scene.render.engine = "BLENDER_WORKBENCH"
-    unresolved = resolve_textures(asset) if asset else 0
+    if asset:
+        resolve_textures(asset)
+        drop_missing_images()
     try:
         shading = scene.display.shading
         shading.light = "STUDIO"
-        # Missing textures render magenta; material colours look saner.
-        shading.color_type = "MATERIAL" if unresolved else "TEXTURE"
+        # Materials whose image is still missing had it removed above, so
+        # they show their material colour instead of magenta.
+        shading.color_type = "TEXTURE"
         shading.show_object_outline = True
         shading.show_cavity = True
         shading.cavity_type = "SCREEN"
@@ -202,30 +407,35 @@ def one_line(exc):
     return (lines[-1] if lines else repr(exc)).strip().replace("\n", " ")
 
 
-argv = sys.argv[sys.argv.index("--") + 1:]
+def main():
+    argv = sys.argv[sys.argv.index("--") + 1:]
 
-if argv[0] == "--batch":
-    with open(argv[1]) as f:
-        jobs = json.load(f)
-    size = int(argv[2])
-    for i, (asset, out) in enumerate(jobs):
-        print("MODON_PREVIEW_START:%d" % i, flush=True)
-        try:
-            load(asset)
-            render(out, size, asset)
-            print("MODON_PREVIEW_DONE:" + out, flush=True)
-        except Exception as e:  # keep the batch going
-            print("MODON_PREVIEW_ERROR:%d:%s" % (i, one_line(e)), flush=True)
-    sys.exit(0)
+    if argv[0] == "--batch":
+        with open(argv[1]) as f:
+            jobs = json.load(f)
+        size = int(argv[2])
+        for i, (asset, out) in enumerate(jobs):
+            print("MODON_PREVIEW_START:%d" % i, flush=True)
+            try:
+                load(asset)
+                render(out, size, asset)
+                print("MODON_PREVIEW_DONE:" + out, flush=True)
+            except Exception as e:  # keep the batch going
+                print("MODON_PREVIEW_ERROR:%d:%s" % (i, one_line(e)), flush=True)
+        sys.exit(0)
 
-asset, out, size = argv[0], argv[1], int(argv[2])
-try:
-    load(asset)
-except PreviewError as e:
-    print("MODON_PREVIEW_ERROR:" + str(e), file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print("MODON_PREVIEW_ERROR:" + one_line(e), file=sys.stderr)
-    sys.exit(1)
-render(out, size, asset)
-print("MODON_PREVIEW_DONE:" + out)
+    asset, out, size = argv[0], argv[1], int(argv[2])
+    try:
+        load(asset)
+    except PreviewError as e:
+        print("MODON_PREVIEW_ERROR:" + str(e), file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print("MODON_PREVIEW_ERROR:" + one_line(e), file=sys.stderr)
+        sys.exit(1)
+    render(out, size, asset)
+    print("MODON_PREVIEW_DONE:" + out)
+
+
+if __name__ == "__main__":
+    main()

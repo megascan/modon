@@ -148,9 +148,15 @@ func TestEnsureReusesAndWaits(t *testing.T) {
 
 func TestUnitIsPortable(t *testing.T) {
 	u := Unit(UnitOptions{Exe: "/home/u/.local/bin/modon", UVDir: "/home/u/.local/bin", Home: "/home/u"})
-	for _, want := range []string{"ExecStart=%h/.local/bin/modon embed-server", "Environment=PATH=%h/.local/bin:", "Restart=always", "WantedBy=default.target"} {
+	for _, want := range []string{"ExecStart=%h/.local/bin/modon embed-server", "Environment=PATH=%h/.local/bin:", "Restart=on-failure"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("unit lacks %q:\n%s", want, u)
+		}
+	}
+	// Started on demand only: never at login, never revived after an idle exit.
+	for _, bad := range []string{"WantedBy=", "Restart=always"} {
+		if strings.Contains(u, bad) {
+			t.Errorf("unit must not contain %q:\n%s", bad, u)
 		}
 	}
 	if strings.Contains(u, "/home/u") {

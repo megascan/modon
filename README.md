@@ -103,7 +103,9 @@ changes it. Env vars always win for secrets:
 | `http_timeout_seconds` | Remote HTTP timeout (default `30`) |
 | `preview.workers` | Parallel thumbnail renders (default `2`) |
 | `embedding.endpoint` / `MODON_EMBED_ENDPOINT` | Embedding server URL, e.g. `http://127.0.0.1:8178`; empty = semantic search off |
-| `embedding.autostart` | Launch the bundled sidecar (via `uv`) when nothing answers at the endpoint |
+| `embedding.autostart` | Launch the bundled sidecar (via `uv`) when a call needs embeddings and nothing answers |
+| `embedding.idle_exit_seconds` | Shut the sidecar down after this long without requests, freeing its RAM (default `900`; negative = never) |
+| `embedding.idle_offload_seconds` | Move the model off the GPU after this long idle (default `600`; negative = never) |
 | `embedding.dims` | Matryoshka size `768` · `512` · `256` (default) · `128`; changing it re-embeds |
 | `embedding.image_tokens` | Vision tokens per image, `70`–`1120` (model default `280`; lower = faster) |
 | `embedding.device` | Sidecar device `cuda` · `cpu` · `mps` (default auto; CUDA OOM falls back to CPU) |
@@ -175,13 +177,17 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   `uv run`; uv installs torch + sentence-transformers on first launch and
   the model downloads from Hugging Face (~1.5 GB). It runs on CUDA in
   bfloat16 (never float16, which yields NaNs) and falls back to CPU, where it
-  works but is slow for images (seconds each). Any OpenAI-compatible
+  works but is slow for images (seconds each). It only runs while used:
+  with `embedding.autostart`, the first call that needs embeddings starts
+  it (~15 s to load the model) and it exits after
+  `embedding.idle_exit_seconds` (default 15 min) idle. Any OpenAI-compatible
   `/v1/embeddings` server (e.g. `llama-server --embeddings --pooling mean`
   with `unsloth/embeddinggemma-2-GGUF`) also works, text only.
 - **Storage.** Vectors live in `asset_vectors` inside the index DB
   (`256` dims → 1 KB per vector), keyed by model + dims + a content hash, so
   `modon embed` only re-embeds what changed; `serve` refreshes changed assets
-  in the background at startup and after `update_asset_metadata`. Search is
+  in the background whenever the server comes up and after
+  `update_asset_metadata` (while it runs). Search is
   brute force in memory (tens of thousands of assets in milliseconds).
 - **Scoring.** A vector hit must stand out from the query's score
   distribution over the whole corpus: z ≥ √(2 ln n) − 0.5 (≈3 for 500
@@ -209,10 +215,10 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   tiebreaker, and ≳0.97 as "probably the same model".
 - **Zero-shot labels are hints.** Image-only category guesses agreed with
   the importer's filename heuristic 47% top-1 / 68% top-3 on a stratified
-  2,095-asset sample, and 40% / 57% over a full 24.5k Synty-heavy library
+  2,095-asset sample, and 42% / 59% over a full 24.5k Synty-heavy library
   (11.3k categorized assets, dominated by character pieces, modular walls
   and building parts where the heuristic is noisy too, e.g. police officers
-  filed under *creature*). Agreement rises with the confidence margin: 75%
+  filed under *creature*). Agreement rises with the confidence margin: 77%
   at the `--classify` default (0.05, ~18% of assets). `--classify` only
   fills *empty* categories and is a dry run unless `--apply`; treat
   `suggest_metadata` as a hint for agents writing real descriptions.
@@ -223,8 +229,17 @@ modon embed --classify [--apply]            # fill empty categories (dry run by 
   file); a crash or 2-minute stall fails just that asset. Textures whose
   stored paths point at the artist's machine are relinked by name from the
   asset's folder and its parents (e.g. `Texture_01.psd` → shipped
-  `Texture_01_A.png`); still-missing ones render in material colours
-  instead of Blender's magenta.
+  `Texture_01_A.png`). Within the asset's own pack, names that drifted from
+  the shipped files are matched too: filler words and a missing `_01`
+  (`PolygonTown_Texture_01_A` → `PolygonTown_01_A.png`), a renamed pack
+  (`PolygonMilitary_` → `PolygonBattleRoyale_`) and working-copy suffixes
+  (`_GoodVersion`, `_Andrew`). A guessed atlas is rejected for materials UV'd
+  for a tiling texture, and missing normal/emission maps are never guessed.
+  Only materials whose colour texture is still missing render in material
+  colour (not Blender's magenta); the rest of the asset keeps its textures.
+  On a 24.5k Synty-heavy library this took thumbnails with a missing
+  texture from 6.5k to ~550. Matcher tests: `python3 -m unittest
+  internal/preview/render_preview_test.py`.
 
 ## How it works
 

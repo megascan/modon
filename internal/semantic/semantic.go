@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -62,8 +63,10 @@ type Engine struct {
 	mu          sync.Mutex
 	queries     map[string][]float32 // small cache of recent query vectors
 	labels      *labelSet
-	lastEnsure  time.Time // last background start attempt
-	clustersDue bool      // vectors changed since clusters were computed
+	lastEnsure  time.Time     // last on-demand start attempt
+	starting    chan struct{} // closed when the start in flight finishes
+	onStart     func()        // runs after an on-demand start succeeds
+	clustersDue bool          // vectors changed since clusters were computed
 }
 
 // New builds the engine; it is inert when embedding.endpoint is unset.
@@ -82,15 +85,22 @@ func (e *Engine) Enabled() bool { return e != nil && e.cl != nil }
 func (e *Engine) modelID() string { return e.cl.Model }
 func (e *Engine) dims() int       { return e.cl.Dims }
 
-// ensureEvery rate-limits background start attempts.
+// ensureEvery rate-limits start attempts after a failed one.
 const ensureEvery = 30 * time.Second
+
+// demandWait is how long a call that needs embeddings waits for the server
+// it started. Loading the model takes ~15s; the very first run installs
+// torch and takes longer, and such calls fall back to keyword search while
+// the server keeps loading.
+const demandWait = 60 * time.Second
 
 // available reports whether the server answers. The client caches the
 // answer briefly (healthy for 10s, down for 3s), so a dead server is
 // noticed within seconds and a revived one is picked up again without a
-// restart. When the server is down and embedding.autostart is set, a start
-// is kicked off in the background (at most every 30s); this call still
-// returns false so the caller degrades to keyword search meanwhile.
+// restart. The server runs only while it is used (it exits when idle), so
+// when it is down and embedding.autostart is set, this starts it and waits
+// up to demandWait. Concurrent callers share one start; after a failed one,
+// calls degrade to keyword search at once for ensureEvery.
 func (e *Engine) available(ctx context.Context) bool {
 	if !e.Enabled() {
 		return false
@@ -99,22 +109,59 @@ func (e *Engine) available(ctx context.Context) bool {
 	if err == nil {
 		return true
 	}
-	if e.cfg.Embedding.Autostart && embed.Unreachable(err) {
-		e.mu.Lock()
-		due := time.Since(e.lastEnsure) >= ensureEvery
-		if due {
-			e.lastEnsure = time.Now()
-		}
-		e.mu.Unlock()
-		if due {
-			go func() { _ = e.ensure(context.WithoutCancel(ctx), 0) }()
-		}
+	if !e.cfg.Embedding.Autostart || !embed.Unreachable(err) {
+		return false
 	}
-	return false
+	e.mu.Lock()
+	done := e.starting
+	if done == nil {
+		if time.Since(e.lastEnsure) < ensureEvery {
+			e.mu.Unlock()
+			return false
+		}
+		e.lastEnsure = time.Now()
+		done = make(chan struct{})
+		e.starting = done
+		go func() {
+			err := e.ensure(context.WithoutCancel(ctx), demandWait)
+			e.mu.Lock()
+			e.starting = nil
+			if err == nil {
+				e.lastEnsure = time.Time{}
+			}
+			onStart := e.onStart
+			e.mu.Unlock()
+			close(done)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "modon: embedding server:", err)
+			} else if onStart != nil {
+				go onStart()
+			}
+		}()
+	}
+	e.mu.Unlock()
+	select {
+	case <-done:
+		return e.cl.Healthy(ctx) == nil
+	case <-ctx.Done():
+		return false
+	}
 }
 
-// Reachable reports whether the embedding server answers right now.
+// Up reports whether the embedding server answers right now, without
+// starting it.
+func (e *Engine) Up(ctx context.Context) bool { return e.Enabled() && e.cl.Healthy(ctx) == nil }
+
+// Reachable reports whether the embedding server answers, starting it on
+// demand when embedding.autostart is set.
 func (e *Engine) Reachable(ctx context.Context) bool { return e.available(ctx) }
+
+// OnStart registers fn to run after this engine starts the server on demand.
+func (e *Engine) OnStart(fn func()) {
+	e.mu.Lock()
+	e.onStart = fn
+	e.mu.Unlock()
+}
 
 // Start makes sure the embedding server runs when embedding.autostart is
 // set: it reuses a running server, otherwise starts the systemd user unit
@@ -651,7 +698,6 @@ func (e *Engine) Status(ctx context.Context) map[string]any {
 		out["server"] = info
 		out["reachable"] = true
 	} else {
-		e.available(ctx) // kicks off a background start when autostart is on
 		out["reachable"] = false
 		out["hint"] = e.statusHint()
 	}

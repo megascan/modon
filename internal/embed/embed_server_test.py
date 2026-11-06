@@ -131,6 +131,24 @@ class OOMRecovery(unittest.TestCase):
             e.encode(["a"])
 
 
+class IdleExit(unittest.TestCase):
+    def test_shuts_down_when_idle_only(self):
+        e = embedder(FakeModel(max_gpu_batch=64))
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), es.make_handler(e))
+        served = threading.Thread(target=srv.serve_forever, daemon=True)
+        served.start()
+        self.addCleanup(srv.server_close)
+        e.last_used = es.time.time() + 3600  # busy: must keep serving
+        watcher = threading.Thread(target=es.exit_when_idle, args=(srv, e, 1), daemon=True)
+        watcher.start()
+        watcher.join(1.5)
+        self.assertTrue(served.is_alive())
+        e.last_used = 0.0  # idle long enough
+        watcher.join(5)
+        served.join(5)
+        self.assertFalse(served.is_alive())
+
+
 class HTTPStatus(unittest.TestCase):
     def serve(self, emb):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), es.make_handler(emb))

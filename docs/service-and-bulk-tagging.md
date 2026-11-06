@@ -15,10 +15,16 @@ server:
   directory) for its whole life. A second one exits at once, so concurrent
   starters never load the model twice. It also refuses to start when
   something already answers at `embedding.endpoint`.
-- Clients with `embedding.autostart: true` reuse a running server. When none
-  answers they start the systemd user unit (if installed), otherwise a
-  detached `modon embed-server` that outlives the client. Meanwhile they
-  fall back to keyword search, then pick the server up within seconds.
+- The server runs only while it is used. Clients with
+  `embedding.autostart: true` reuse a running server; when none answers and
+  a call needs embeddings (search, similar, suggest, embedding), they start
+  the systemd user unit (if installed), otherwise a detached
+  `modon embed-server` that outlives the client, and wait up to 60 s for it
+  (the model loads in ~15 s; the first run installs torch and falls back to
+  keyword search meanwhile). `modon serve` itself never starts it.
+- **Idle exit:** after `embedding.idle_exit_seconds` (default 900; negative
+  = never) without embedding requests the server shuts down, freeing its
+  RAM. Health checks do not count as use.
 - Health checks expire: a healthy server is re-checked after 10 s, a down
   one after 3 s, and `index_stats` always probes. A dead or restarted
   server is noticed without restarting clients.
@@ -26,15 +32,18 @@ server:
 ### systemd user unit
 
 ```sh
-modon service install          # write ~/.config/systemd/user/modon-embed.service,
-                               # then systemctl --user enable --now
+modon service install          # write ~/.config/systemd/user/modon-embed.service
+                               # (not enabled: started on demand, stops when idle)
 modon service install --replace  # first stop an ad-hoc embed-server that holds the lock
 modon service status           # systemctl status + a live health check (device, OOM count)
 modon service print            # print the unit without installing
 modon service uninstall
 ```
 
-The unit runs `modon embed-server` with `Restart=always`. Paths under your
+The unit runs `modon embed-server` with `Restart=on-failure`, so a crash is
+restarted but an idle exit is not. It has no `[Install]` section and is never
+started at login; reinstalling disables units from older versions that
+were. Paths under your
 home directory are written with systemd's `%h`, and the directory holding
 `uv` is put on `PATH`. It looks like this:
 
@@ -42,7 +51,7 @@ home directory are written with systemd's `%h`, and the directory holding
 [Service]
 ExecStart=%h/.local/bin/modon embed-server
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Restart=always
+Restart=on-failure
 RestartSec=30
 Nice=5
 ```

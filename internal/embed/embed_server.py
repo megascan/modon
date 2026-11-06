@@ -19,7 +19,7 @@ Text arrives already prefixed by modon ("task: search result | query: ...",
 prefix, per the model card.
 
 Run:  uv run embed_server.py [--host 127.0.0.1] [--port 8178] [--image-tokens 280]
-                             [--idle-offload 600]
+                             [--idle-offload 600] [--idle-exit 900]
 modon launches it itself with `modon embed-server` (or the systemd user unit
 from `modon service install`).
 
@@ -334,6 +334,21 @@ def make_handler(emb):
     return H
 
 
+def exit_when_idle(srv, emb, idle_exit):
+    """Stop serving after idle_exit seconds without embedding requests (health
+    checks do not count), so the model only holds memory while it is used.
+    Clients start the server again on demand."""
+    while True:
+        time.sleep(min(15, idle_exit))
+        if time.time() - emb.last_used < idle_exit:
+            continue
+        with emb.lock:  # never in the middle of a request
+            if time.time() - emb.last_used >= idle_exit:
+                log(f"idle for {idle_exit}s: shutting down")
+                srv.shutdown()
+                return
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default="127.0.0.1")
@@ -343,6 +358,8 @@ def main():
     ap.add_argument("--device", default=None, help="cuda | cpu | mps (default: auto)")
     ap.add_argument("--idle-offload", type=int, default=0,
                     help="move the model off the GPU after this many idle seconds (0 = never)")
+    ap.add_argument("--idle-exit", type=int, default=0,
+                    help="shut down after this many idle seconds, freeing RAM (0 = never)")
     ap.add_argument("--check", action="store_true", help="load the model, embed a probe, exit")
     a = ap.parse_args()
 
@@ -354,6 +371,8 @@ def main():
         return
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(emb))
     log(f"listening on http://{a.host}:{a.port}")
+    if a.idle_exit > 0:
+        threading.Thread(target=exit_when_idle, args=(srv, emb, a.idle_exit), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

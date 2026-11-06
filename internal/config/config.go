@@ -64,6 +64,10 @@ type EmbeddingConfig struct {
 	// requests, freeing VRAM for games and editors; it returns on the next
 	// request. 0 = default (600), negative = keep it on the GPU.
 	IdleOffloadSeconds int `json:"idle_offload_seconds,omitempty"`
+	// IdleExitSeconds shuts the server down after this long without
+	// requests, freeing its memory; the next request that needs embeddings
+	// starts it again. 0 = default (900), negative = keep it running.
+	IdleExitSeconds int `json:"idle_exit_seconds,omitempty"`
 }
 
 // DefaultIdleOffload is the idle time before the model leaves the GPU.
@@ -78,6 +82,20 @@ func (e EmbeddingConfig) IdleOffload() int {
 		return DefaultIdleOffload
 	}
 	return e.IdleOffloadSeconds
+}
+
+// DefaultIdleExit is the idle time before the server shuts down.
+const DefaultIdleExit = 900
+
+// IdleExit resolves IdleExitSeconds (0 = never).
+func (e EmbeddingConfig) IdleExit() int {
+	switch {
+	case e.IdleExitSeconds < 0:
+		return 0
+	case e.IdleExitSeconds == 0:
+		return DefaultIdleExit
+	}
+	return e.IdleExitSeconds
 }
 
 // Defaults returns the configuration with all optional fields populated.

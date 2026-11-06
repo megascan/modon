@@ -52,18 +52,16 @@ func NewDeps() (*Deps, error) {
 	return d, nil
 }
 
-// Warm starts the embedding sidecar when autostart is on and, once it
-// answers, embeds whatever changed since the last run (text documents and
-// existing previews; rendering stays an explicit `modon embed --render`).
-// Search falls back to keyword ranking until then.
+// Warm embeds whatever changed since the last run (text documents and
+// existing previews; rendering stays an explicit `modon embed --render`)
+// whenever the embedding server is up: now if it already runs, else after a
+// tool call starts it. It never starts the server itself, so an idle MCP
+// client holds no model in memory.
 func (d *Deps) Warm(ctx context.Context) {
 	if !d.Sem.Enabled() {
 		return
 	}
-	go func() {
-		if err := d.Sem.Start(ctx, 20*time.Minute); err != nil {
-			fmt.Fprintln(os.Stderr, "modon: embedding sidecar:", err)
-		}
+	backfill := func() {
 		stats, err := d.Sem.Backfill(ctx, semantic.BackfillOptions{Text: true, Images: true})
 		if errors.Is(err, semantic.ErrBusy) {
 			return // another modon (e.g. a second MCP client) is on it
@@ -75,7 +73,11 @@ func (d *Deps) Warm(ctx context.Context) {
 		if stats.Text+stats.Images > 0 {
 			fmt.Fprintf(os.Stderr, "modon: embedded %d text / %d image vectors\n", stats.Text, stats.Images)
 		}
-	}()
+	}
+	d.Sem.OnStart(backfill)
+	if d.Sem.Up(ctx) {
+		go backfill()
+	}
 }
 
 func (d *Deps) Close() error {

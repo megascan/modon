@@ -165,10 +165,12 @@ Embed flags:
 Embed-server flags:
   --port N --device cuda|cpu|mps --image-tokens N --text-only
   --idle-offload SECONDS (leave the GPU when idle; default embedding.idle_offload_seconds)
+  --idle-exit SECONDS (shut down when idle; default embedding.idle_exit_seconds)
   --detach (start in the background and return)
   One server per machine: a second embed-server exits when one is running.
-  Clients with embedding.autostart reuse it, or start the systemd unit
-  (modon service install) / a detached server when it is missing.
+  Clients with embedding.autostart reuse it, or start it on demand (the
+  systemd unit from modon service install, else a detached server) when a
+  call needs embeddings; it exits again after embedding.idle_exit_seconds.
 
 Unclassified flags (bulk tagging):
   --limit N --offset N --worker ID --lease 15m --one-per-cluster --json
@@ -620,6 +622,8 @@ func configValue(cfg *config.Config, key string) string {
 		return strconv.Itoa(cfg.Embedding.TimeoutSeconds)
 	case "embedding.idle_offload_seconds":
 		return strconv.Itoa(cfg.Embedding.IdleOffloadSeconds)
+	case "embedding.idle_exit_seconds":
+		return strconv.Itoa(cfg.Embedding.IdleExitSeconds)
 	default:
 		return "unknown key (see modon config with no args)"
 	}
@@ -718,6 +722,12 @@ func setConfigValue(cfg *config.Config, key, val string) error {
 			return err
 		}
 		cfg.Embedding.IdleOffloadSeconds = n
+	case "embedding.idle_exit_seconds":
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return err
+		}
+		cfg.Embedding.IdleExitSeconds = n
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}
@@ -743,7 +753,7 @@ func cmdStats(_ []string) error {
 // startSidecar makes sure the shared embedding server runs for CLI
 // commands when embedding.autostart is set, waiting up to wait for it.
 func startSidecar(d *server.Deps, wait time.Duration) {
-	if !d.Sem.Enabled() || !d.Cfg.Embedding.Autostart || d.Sem.Reachable(context.Background()) {
+	if !d.Sem.Enabled() || !d.Cfg.Embedding.Autostart || d.Sem.Up(context.Background()) {
 		return
 	}
 	if wait == 0 {
@@ -825,6 +835,7 @@ func cmdEmbedServer(args []string) error {
 	imageTokens := fs.Int("image-tokens", 0, "vision tokens per image (70-1120)")
 	textOnly := fs.Bool("text-only", false, "skip the vision encoder")
 	idle := fs.Int("idle-offload", -2, "seconds idle before leaving the GPU (0 = never)")
+	idleExit := fs.Int("idle-exit", -2, "seconds idle before shutting down (0 = never)")
 	detach := fs.Bool("detach", false, "start in the background and return")
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -865,7 +876,7 @@ func cmdEmbedServer(args []string) error {
 	o := embed.SidecarOptions{
 		UV: cfg.Embedding.UVPath, CacheDir: cache, Endpoint: endpoint,
 		ImageTokens: cfg.Embedding.ImageTokens, Device: cfg.Embedding.Device, TextOnly: *textOnly,
-		IdleOffload: cfg.Embedding.IdleOffload(),
+		IdleOffload: cfg.Embedding.IdleOffload(), IdleExit: cfg.Embedding.IdleExit(),
 	}
 	if *device != "" {
 		o.Device = *device
@@ -875,6 +886,9 @@ func cmdEmbedServer(args []string) error {
 	}
 	if *idle >= 0 {
 		o.IdleOffload = *idle
+	}
+	if *idleExit >= 0 {
+		o.IdleExit = *idleExit
 	}
 	if cfg.Embedding.Endpoint == "" {
 		fmt.Fprintf(os.Stderr, "tip: modon config set embedding.endpoint %s\n", endpoint)

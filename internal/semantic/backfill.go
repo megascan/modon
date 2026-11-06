@@ -428,11 +428,12 @@ func (e *Engine) embedImages(ctx context.Context, assets []model.Asset, o Backfi
 }
 
 // Refresh re-embeds specific assets (after metadata edits or new previews),
-// best-effort and quietly skipped (nil stats) when the server is down. Only
+// best-effort and quietly skipped (nil stats) when the server is down; it
+// does not start the server (the next backfill picks the edits up). Only
 // changed documents are embedded, batched like a full run, so refreshing a
 // whole batch of edits at once costs a few embedding calls, not one each.
 func (e *Engine) Refresh(ctx context.Context, ids ...int64) *BackfillStats {
-	if len(ids) == 0 || !e.available(ctx) {
+	if len(ids) == 0 || !e.Up(ctx) {
 		return nil
 	}
 	stats, _ := e.Backfill(ctx, BackfillOptions{Text: true, Images: true, IDs: ids})

@@ -27,6 +27,7 @@ type SidecarOptions struct {
 	Device      string // cuda | cpu | mps, "" = auto
 	TextOnly    bool
 	IdleOffload int // seconds idle before the model leaves the GPU, 0 = never
+	IdleExit    int // seconds idle before the server shuts down, 0 = never
 }
 
 // ScriptPath writes the embedded sidecar script into dir and returns it.
@@ -93,6 +94,9 @@ func Command(ctx context.Context, o SidecarOptions) (*exec.Cmd, error) {
 	}
 	if o.IdleOffload > 0 {
 		args = append(args, "--idle-offload", strconv.Itoa(o.IdleOffload))
+	}
+	if o.IdleExit > 0 {
+		args = append(args, "--idle-exit", strconv.Itoa(o.IdleExit))
 	}
 	cmd := exec.CommandContext(ctx, uvPath, args...)
 	cmd.Dir = o.CacheDir

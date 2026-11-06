@@ -20,10 +20,9 @@ import (
 
 func cmdService(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: modon service install [--no-enable] [--replace] | uninstall | status | print")
+		return fmt.Errorf("usage: modon service install [--replace] | uninstall | status | print")
 	}
 	fs := flag.NewFlagSet("service", flag.ContinueOnError)
-	noEnable := fs.Bool("no-enable", false, "write the unit but do not enable/start it")
 	replace := fs.Bool("replace", false, "stop a running ad-hoc embed-server first")
 	if err := parseFlags(fs, args[1:]); err != nil {
 		return err
@@ -37,7 +36,7 @@ func cmdService(args []string) error {
 		fmt.Print(unit)
 		return nil
 	case "install":
-		return serviceInstall(!*noEnable, *replace)
+		return serviceInstall(*replace)
 	case "uninstall":
 		_ = systemctl("disable", "--now", embed.UnitName)
 		p, err := embed.UnitPath()
@@ -91,7 +90,10 @@ func systemctl(args ...string) error {
 	return cmd.Run()
 }
 
-func serviceInstall(enable, replace bool) error {
+// serviceInstall writes the unit without enabling it: clients start it on
+// demand and it exits when idle. Units from older versions were enabled at
+// login, so that is undone.
+func serviceInstall(replace bool) error {
 	unit, err := renderUnit()
 	if err != nil {
 		return err
@@ -110,25 +112,19 @@ func serviceInstall(enable, replace bool) error {
 	if err := systemctl("daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl --user daemon-reload: %w", err)
 	}
-	if !enable {
-		fmt.Println("enable with: systemctl --user enable --now", embed.UnitName)
-		return nil
-	}
+	_ = exec.Command("systemctl", "--user", "disable", embed.UnitName).Run()
 	cache, err := config.CacheDir()
 	if err != nil {
 		return err
 	}
 	if pid, held := embed.LockHolder(embed.ServerLockPath(cache)); held && pid > 0 && !unitOwns(pid) {
 		if !replace {
-			fmt.Printf("note: an ad-hoc embed-server (pid %d) is running; the unit takes over when it exits (or re-run with --replace)\n", pid)
+			fmt.Printf("note: an ad-hoc embed-server (pid %d) is running; the unit is used once it exits (or re-run with --replace)\n", pid)
 		} else if err := stopPID(pid, 30*time.Second); err != nil {
 			return err
 		}
 	}
-	if err := systemctl("enable", "--now", embed.UnitName); err != nil {
-		return fmt.Errorf("systemctl --user enable --now %s: %w", embed.UnitName, err)
-	}
-	fmt.Println("enabled", embed.UnitName, "- check with: modon service status")
+	fmt.Println("installed", embed.UnitName, "- it starts when modon needs embeddings and stops when idle; check with: modon service status")
 	return nil
 }
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// UnitName is the systemd user unit that keeps the embedding server up.
+// UnitName is the systemd user unit that runs the embedding server on demand.
 const UnitName = "modon-embed.service"
 
 // UnitPath is where the user unit lives
@@ -37,9 +37,9 @@ type UnitOptions struct {
 	Home  string // paths under it are written as %h so the unit stays portable
 }
 
-// Unit renders the systemd user unit. The server restarts whenever it
-// stops; when another server already holds the lock it exits and systemd
-// retries later, taking over once the other one is gone.
+// Unit renders the systemd user unit. It is never enabled: clients start it
+// when a call needs embeddings, and the server exits by itself once idle
+// (a clean exit, so systemd leaves it stopped). Only crashes are restarted.
 func Unit(o UnitOptions) string {
 	h := func(p string) string {
 		if o.Home != "" && (p == o.Home || strings.HasPrefix(p, o.Home+"/")) {
@@ -60,13 +60,10 @@ After=network.target
 Type=simple
 ExecStart=%s embed-server
 Environment=PATH=%s
-Restart=always
+Restart=on-failure
 RestartSec=30
 TimeoutStopSec=30
 # A background helper: yield CPU to games and editors.
 Nice=5
-
-[Install]
-WantedBy=default.target
 `, h(o.Exe), path)
 }
